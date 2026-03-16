@@ -1,0 +1,334 @@
+# ES Hot-Zone Trader Configuration
+
+account:
+  capital: 50000
+  max_contracts: 5
+  default_contracts: 1
+  risk_per_contract: 100
+  preferred_id_match: "PRAC"
+  require_preferred_account: true
+
+symbols:
+  - ES
+
+hot_zones:
+  - name: "Pre-Open"
+    start: "06:30"
+    end: "08:30"
+    timezone: "America/Chicago"
+    enabled: true
+
+  - name: "Post-Open"
+    start: "09:00"
+    end: "11:00"
+    timezone: "America/Chicago"
+    enabled: true
+
+  - name: "Midday"
+    start: "12:00"
+    end: "13:00"
+    timezone: "America/Chicago"
+    enabled: true
+
+  - name: "Close-Scalp"
+    start: "12:45"
+    end: "13:00"
+    timezone: "America/Chicago"
+    mode: "flatten_only"
+    enabled: true
+
+sessions:
+  timezone: "America/Chicago"
+  eth_reset_hour: 17
+  eth_reset_minute: 0
+  rth_start_hour: 8
+  rth_start_minute: 30
+  rth_end_hour: 15
+  rth_end_minute: 15
+
+strategy:
+  atr_length: 14
+  vwap_session: "RTH"
+  vwap_source: "HLC3"
+  orb_range_minutes: 15
+  trend_ma_length: 100
+  trend_ma_type: "EMA"
+  vwap_deviation_threshold: 1.5
+  vwap_confirmation_bars: 2
+  mr_rsi_length: 14
+  mr_rsi_oversold: 35
+  mr_rsi_overbought: 65
+  mr_band_deviation: 2.0
+  mr_time_stop_minutes: 20
+  mr_exit_at_vwap: true
+
+alpha:
+  matrix_version: "hotzone-v3"
+  decision_interval: "tick_and_bar"
+  min_entry_score: 5.0
+  min_score_gap: 2.0
+  exit_decay_score: 1.5
+  reverse_score_gap: 2.5
+  full_size_score: 6.5
+  flat_bias_buffer: 0.5
+  stop_loss_atr: 1.2
+  take_profit_atr:
+    Pre-Open: 2.2
+    Post-Open: 2.0
+    Midday: 1.3
+    Close-Scalp: 0.8
+  max_hold_minutes:
+    Pre-Open: 40
+    Post-Open: 55
+    Midday: 20
+    Close-Scalp: 5
+  zone_weights:
+    Pre-Open:
+      long:
+        orb_break: 1.8
+        opening_drive: 1.55
+        eth_vwap_distance_z: 0.85
+        eth_vwap_slope: 0.85
+        trend_state: 1.35
+        ofi_zscore: 1.1
+        execution_state: 0.7
+      short:
+        orb_break: 1.9
+        opening_drive: 1.35
+        eth_vwap_distance_z: 0.75
+        eth_vwap_slope: 0.75
+        trend_state: 1.2
+        ofi_zscore: 1.0
+        execution_state: 0.65
+      flat:
+        event_state: 1.0
+        execution_state: 0.9
+        spread_regime: 0.6
+        regime_stress: 1.1
+    Post-Open:
+      long:
+        trend_state: 1.75
+        rth_vwap_slope: 1.0
+        rth_vwap_distance_z: 0.95
+        pullback_quality: 1.45
+        ofi_zscore: 0.95
+        spread_regime: 0.45
+        execution_state: 0.55
+      short:
+        trend_state: 1.55
+        rth_vwap_slope: 0.95
+        rth_vwap_distance_z: 0.8
+        pullback_quality: 1.3
+        ofi_zscore: 0.85
+        spread_regime: 0.4
+        execution_state: 0.5
+      flat:
+        range_state: 0.7
+        event_state: 1.0
+        execution_state: 0.9
+        regime_stress: 1.0
+    Midday:
+      long:
+        extension_state: 1.8
+        range_state: 1.4
+        vwap_distance: 1.2
+        wick_rejection: 1.2
+        spread_regime: 0.5
+        execution_state: 0.5
+      short:
+        extension_state: 1.85
+        range_state: 1.35
+        vwap_distance: 1.25
+        wick_rejection: 1.1
+        spread_regime: 0.5
+        execution_state: 0.5
+      flat:
+        trend_state: 1.0
+        event_state: 0.9
+        execution_state: 0.8
+        regime_stress: 1.0
+    Close-Scalp:
+      long: {}
+      short: {}
+      flat:
+        event_state: 1.0
+        execution_state: 1.0
+        regime_stress: 1.0
+  zone_vetoes:
+    Pre-Open:
+      max_atr_accel: 0.75
+      max_spread_ticks: 4
+      reject_orb_middle: true
+      require_execution_tradeable: true
+      blocked_regimes:
+        - "STRESS"
+    Post-Open:
+      flat_vwap_threshold: 0.08
+      flat_ema_threshold: 0.08
+      max_spread_ticks: 4
+      require_execution_tradeable: true
+      blocked_regimes:
+        - "RANGE"
+        - "STRESS"
+    Midday:
+      max_ema_slope: 0.15
+      max_atr_percentile: 0.7
+      min_minutes_remaining: 10
+      require_mean_reversion_confirmation: true
+      require_execution_tradeable: true
+      blocked_regimes:
+        - "TREND"
+        - "STRESS"
+    Close-Scalp:
+      flatten_only: true
+
+risk:
+  max_daily_loss: 600
+  max_position_loss: 200
+  max_consecutive_losses: 3
+  max_trades_per_hour: 6
+  max_trades_per_zone: 3
+  max_daily_trades: 10
+  use_volatility_sizing: true
+  target_daily_risk_pct: 1.0
+  enable_circuit_breakers: true
+  vol_spike_threshold: 1.75
+  session_timezone: "America/Chicago"
+  session_reset_hour: 17
+  session_reset_minute: 0
+
+order_execution:
+  use_limit_orders: true
+  limit_offset_ticks: 1
+  market_order_fallback: true
+  max_slippage_ticks: 3
+  cancel_timeout_seconds: 60
+
+blackout_events:
+  pre_minutes: 5
+  post_minutes: 10
+  news_times:
+    - "08:30"
+    - "10:00"
+    - "14:00"
+
+volume_profile:
+  tick_size: 0.25
+  value_area_pct: 0.7
+  source: "close"
+  min_bars: 10
+
+order_flow:
+  window_seconds: 300
+  zscore_window: 120
+  volume_window: 60
+  quote_rate_baseline: 20.0
+  stress_spread_ticks: 6.0
+
+regime:
+  enabled: true
+  trend_slope_threshold: 0.22
+  trend_ofi_threshold: 0.6
+  range_slope_threshold: 0.1
+  stress_spread_ticks: 5.0
+  stress_vol_ratio: 1.8
+  stress_quote_rate: 5.0
+  event_cooldown_minutes: 10
+
+watchdog:
+  enabled: true
+  feed_stale_seconds: 15
+  broker_ack_stale_seconds: 20
+  protection_ack_seconds: 5
+  stale_order_seconds: 60
+
+replay_execution:
+  market_slippage_ticks: 0.5
+  latency_ms_default: 50
+  latency_ms_jitter: 25
+  allow_partial_fills: true
+  limit_touch_fill_ratio: 1.0
+  dsr_trials: 20
+  volume_mode: "auto"
+  commission_per_contract: 2.5
+  exchange_fee_per_contract: 1.25
+  stress_slippage_ticks: 2.0
+  limit_fill_penalty_ticks: 0.5
+
+validation:
+  benchmarks_enabled: true
+  benchmark_zone_strategies:
+    Pre-Open: "ORB"
+    Post-Open: "VWAP_TREND"
+    Midday: "VWAP_MR"
+    Close-Scalp: "FLATTEN_ONLY"
+  max_features_per_side: 7
+  walk_forward_train_bars: 120
+  walk_forward_test_bars: 60
+  min_positive_test_window_ratio: 0.5
+  max_zone_pnl_share: 0.8
+  synthetic_quote_policy: "reject"
+  max_prac_fill_drift_ticks: 2.0
+
+safety:
+  prac_only: true
+  preferred_account_match: "PRAC"
+  allow_non_prac_override_env: "ALLOW_NON_PRAC_ACCOUNT"
+
+event_provider:
+  provider: "local_file"
+  calendar_path: "config/events.yaml"
+  refresh_seconds: 60
+  emergency_halt_path: "config/emergency_halt.flag"
+  emergency_halt_max_age_minutes: 1440
+  default_timezone: "America/New_York"
+  impact_windows:
+    low:
+      pre: 0
+      post: 5
+    medium:
+      pre: 5
+      post: 10
+    high:
+      pre: 15
+      post: 20
+
+api:
+  base_url: "https://api.topstepx.com"
+  ws_url: "wss://rtapi.topstepx.com"
+  timeout: 30
+  retry_attempts: 3
+
+replay:
+  mode: "projectx_feed_replay"
+  primary_granularity: "tick_bbo_if_available"
+  fallback_granularity: "1m_bars"
+  segment_size: 2500
+
+server:
+  health_port: 8080
+  debug_port: 8081
+  host: "127.0.0.1"
+  mcp_enabled: true
+  mcp_path: "/mcp"
+
+logging:
+  level: "INFO"
+  file: "logs/trading.log"
+  max_bytes: 10485760
+  backup_count: 5
+  console_colors: true
+
+observability:
+  enabled: true
+  sqlite_path: "logs/observability.db"
+  flush_interval_ms: 250
+  batch_size: 100
+  queue_max_size: 10000
+  retention_days: 14
+  capture_run_provenance: true
+  persist_completed_trades: true
+  backfill_missing_trade_records: true
+
+replay:
+  mode: "projectx_feed_replay"
