@@ -22,32 +22,36 @@ _bridge_stop = threading.Event()
 def _collect_state_snapshot() -> dict[str, Any]:
     """Current debug state for ingest."""
     try:
-        return get_state().to_dict()
+        state = get_state().to_dict()
+        run_id = state.get("run_id") or state.get("observability", {}).get("run_id")
+        if run_id:
+            state["run_id"] = run_id
+        return state
     except Exception:
         logger.exception("Bridge: get_state failed")
         return {}
 
 
-def _collect_events(limit: int = 200) -> list[dict[str, Any]]:
+def _collect_events(limit: int = 200, after_id: int | None = None) -> list[dict[str, Any]]:
     """Recent events from observability store."""
     try:
         store = get_observability_store()
         if not store.enabled():
             return []
-        rows = store.query_events(limit=limit)
+        rows = store.query_events(limit=limit, after_id=after_id, ascending=True)
         return [dict(r) for r in rows]
     except Exception:
         logger.exception("Bridge: query_events failed")
         return []
 
 
-def _collect_trades(limit: int = 100) -> list[dict[str, Any]]:
+def _collect_trades(limit: int = 100, after_id: int | None = None) -> list[dict[str, Any]]:
     """Recent completed trades."""
     try:
         store = get_observability_store()
         if not store.enabled():
             return []
-        rows = store.query_completed_trades(limit=limit)
+        rows = store.query_completed_trades(limit=limit, after_id=after_id, ascending=True)
         return [dict(r) for r in rows]
     except Exception:
         logger.exception("Bridge: query_completed_trades failed")
@@ -60,6 +64,9 @@ def _run_bridge_loop(outbox: RailwayOutbox, ingest_url: str, api_key: str, inter
 
     last_state_ts = 0.0
     state_interval = max(10.0, interval * 0.5)
+    sent_run_manifest = False
+    last_event_id_sent = 0
+    last_trade_id_sent = 0
 
     while not _bridge_stop.is_set():
         try:
@@ -70,6 +77,12 @@ def _run_bridge_loop(outbox: RailwayOutbox, ingest_url: str, api_key: str, inter
             store = get_observability_store()
             run_id = store.get_run_id() if store.enabled() else "unknown"
 
+            if not sent_run_manifest and run_id and run_id != "unknown":
+                manifest = store.get_run_manifest(run_id)
+                if manifest:
+                    outbox.enqueue("run_manifest", manifest, batch_id=f"run_manifest_{run_id}")
+                    sent_run_manifest = True
+
             # Collect and enqueue state periodically
             if now - last_state_ts >= state_interval:
                 state = _collect_state_snapshot()
@@ -77,14 +90,41 @@ def _run_bridge_loop(outbox: RailwayOutbox, ingest_url: str, api_key: str, inter
                     outbox.enqueue("state", state, batch_id=f"state_{run_id}_{int(now)}")
                 last_state_ts = now
 
-            # Enqueue events/trades with deterministic batch_id so we don't duplicate (INSERT OR IGNORE)
-            interval_ts = int(now // interval) * int(interval)
-            events = _collect_events(limit=100)
-            if events:
-                outbox.enqueue("events", {"events": events}, batch_id=f"events_{run_id}_{interval_ts}")
-            trades = _collect_trades(limit=50)
-            if trades:
-                outbox.enqueue("trades", {"trades": trades}, batch_id=f"trades_{run_id}_{interval_ts}")
+            # Incrementally enqueue events/trades so older blockers are not skipped under bursty load.
+            while True:
+                events = _collect_events(limit=250, after_id=last_event_id_sent)
+                if not events:
+                    break
+                events.sort(key=lambda item: int(item.get("id", 0)))
+                last_event_id_sent = max(last_event_id_sent, max(int(event.get("id", 0)) for event in events))
+                batch_id = f"events_{run_id}_{last_event_id_sent}"
+                outbox.enqueue("events", {"events": events}, batch_id=batch_id)
+                if len(events) < 250:
+                    break
+
+            while True:
+                trades = _collect_trades(limit=250, after_id=last_trade_id_sent)
+                if not trades:
+                    break
+                trades.sort(key=lambda item: int(item.get("id", 0)))
+                last_trade_id_sent = max(last_trade_id_sent, max(int(trade.get("id", 0)) for trade in trades))
+                batch_id = f"trades_{run_id}_{last_trade_id_sent}"
+                outbox.enqueue("trades", {"trades": trades}, batch_id=batch_id)
+                if len(trades) < 250:
+                    break
+
+            outbox.enqueue(
+                "bridge_health",
+                {
+                    "run_id": run_id,
+                    "bridge_status": "running",
+                    "bridge_interval_seconds": interval,
+                    "state_interval_seconds": state_interval,
+                    "sent_run_manifest": sent_run_manifest,
+                    "observed_at": time.time(),
+                },
+                batch_id=f"bridge_health_{run_id}_{int(now)}",
+            )
 
             # Drain outbox
             batches = outbox.dequeue_batch(limit=10)
@@ -96,7 +136,13 @@ def _run_bridge_loop(outbox: RailwayOutbox, ingest_url: str, api_key: str, inter
                 except Exception as e:
                     outbox.mark_failed(row_id, str(e))
                     continue
-                path = {"state": "/ingest/state", "events": "/ingest/events", "trades": "/ingest/trades"}.get(kind, "")
+                path = {
+                    "state": "/ingest/state",
+                    "events": "/ingest/events",
+                    "trades": "/ingest/trades",
+                    "run_manifest": "/ingest/run-manifest",
+                    "bridge_health": "/ingest/bridge-health",
+                }.get(kind, "")
                 if not path:
                     outbox.mark_sent(row_id)
                     continue

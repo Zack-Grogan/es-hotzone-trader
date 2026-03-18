@@ -318,7 +318,7 @@ server:
   host: "127.0.0.1"
   mcp_enabled: true
   mcp_path: "/mcp"
-  railway_mcp_url: ""
+  railway_mcp_url: "https://g-trade-mcp-production.up.railway.app"
 
 logging:
   level: "INFO"
@@ -337,8 +337,8 @@ observability:
   capture_run_provenance: true
   persist_completed_trades: true
   backfill_missing_trade_records: true
-  railway_ingest_url: ""
-  railway_ingest_api_key: ""
+  railway_ingest_url: "https://g-trade-ingest-production.up.railway.app"
+  railway_ingest_api_key: "SD0u+umAc7SjuCG8hDLABo43I7MJ4jA2VZfU"
   bridge_interval_seconds: 30.0
   outbox_path: "logs/railway_outbox.db"
   bridge_retry_attempts: 5

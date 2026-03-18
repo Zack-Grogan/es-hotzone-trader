@@ -6,6 +6,7 @@ import os
 import tempfile
 import unittest
 
+from src.config import get_config, load_config, set_config
 from src.bridge.outbox import RailwayOutbox
 from src.bridge.railway_bridge import start_railway_bridge, stop_railway_bridge
 
@@ -51,6 +52,14 @@ class TestRailwayOutbox(unittest.TestCase):
 class TestRailwayBridgeStart(unittest.TestCase):
     def test_start_returns_false_when_no_url(self) -> None:
         stop_railway_bridge()
-        # Rely on default config having empty railway_ingest_url
-        started = start_railway_bridge()
-        self.assertFalse(started)
+        previous = get_config()
+        config = load_config()
+        config.observability.railway_ingest_url = ""
+        config.observability.railway_ingest_api_key = ""
+        set_config(config)
+        try:
+            started = start_railway_bridge()
+            self.assertFalse(started)
+        finally:
+            stop_railway_bridge()
+            set_config(previous)

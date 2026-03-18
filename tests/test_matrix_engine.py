@@ -1372,6 +1372,84 @@ class ObservabilityStoreTests(unittest.TestCase):
             self.assertTrue(Path(config.observability.sqlite_path).exists())
             store.stop()
 
+    def test_observability_store_query_after_id_filters_old_rows(self) -> None:
+        config = build_config()
+        config.observability.enabled = True
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config.observability.sqlite_path = str(Path(temp_dir) / "observability.db")
+            set_config(config)
+            store = get_observability_store(force_recreate=True, config=config)
+            store.start()
+            for idx in range(3):
+                store.record_event(
+                    category="system",
+                    event_type=f"event_{idx + 1}",
+                    source="tests.test_matrix_engine",
+                    payload={"value": idx + 1},
+                    symbol="ES",
+                    action=f"event_{idx + 1}",
+                    reason=f"event_{idx + 1}",
+                )
+            store.force_flush()
+
+            event_rows = store.query_events(limit=2, after_id=0, ascending=True)
+            next_event_rows = store.query_events(limit=2, after_id=event_rows[-1]["id"], ascending=True)
+
+            trades = [
+                TradeRecord(
+                    entry_time=datetime.fromisoformat("2026-03-16T12:01:00+00:00"),
+                    exit_time=datetime.fromisoformat("2026-03-16T12:02:00+00:00"),
+                    direction=1,
+                    contracts=1,
+                    entry_price=100.0,
+                    exit_price=101.0,
+                    pnl=50.0,
+                    zone="Post-Open",
+                    strategy="WEIGHTED_SCORE_MATRIX",
+                    regime="TREND",
+                    event_tags=["opening_drive"],
+                ),
+                TradeRecord(
+                    entry_time=datetime.fromisoformat("2026-03-16T12:03:00+00:00"),
+                    exit_time=datetime.fromisoformat("2026-03-16T12:04:00+00:00"),
+                    direction=-1,
+                    contracts=1,
+                    entry_price=102.0,
+                    exit_price=101.0,
+                    pnl=50.0,
+                    zone="Post-Open",
+                    strategy="WEIGHTED_SCORE_MATRIX",
+                    regime="TREND",
+                    event_tags=["pullback"],
+                ),
+                TradeRecord(
+                    entry_time=datetime.fromisoformat("2026-03-16T12:05:00+00:00"),
+                    exit_time=datetime.fromisoformat("2026-03-16T12:06:00+00:00"),
+                    direction=1,
+                    contracts=1,
+                    entry_price=103.0,
+                    exit_price=104.0,
+                    pnl=50.0,
+                    zone="Post-Open",
+                    strategy="WEIGHTED_SCORE_MATRIX",
+                    regime="TREND",
+                    event_tags=["continuation"],
+                ),
+            ]
+            for trade in trades:
+                store.record_completed_trade(trade)
+
+            trade_rows = store.query_completed_trades(limit=2, after_id=0, ascending=True)
+            next_trade_rows = store.query_completed_trades(limit=2, after_id=trade_rows[-1]["id"], ascending=True)
+
+            self.assertTrue(event_rows)
+            self.assertEqual([row["id"] for row in event_rows], [1, 2])
+            self.assertEqual([row["id"] for row in next_event_rows], [3])
+            self.assertTrue(trade_rows)
+            self.assertEqual([row["id"] for row in trade_rows], [1, 2])
+            self.assertEqual([row["id"] for row in next_trade_rows], [3])
+            store.stop()
+
     def test_observability_store_persists_run_manifest_and_completed_trade(self) -> None:
         config = build_config()
         config.observability.enabled = True

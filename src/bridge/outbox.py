@@ -57,17 +57,17 @@ class RailwayOutbox:
         self._conn.commit()
 
     def enqueue(self, kind: str, payload: dict[str, Any], batch_id: Optional[str] = None) -> bool:
-        """Append a batch to the outbox. Returns True if enqueued."""
+        """Append a batch to the outbox. Returns True if enqueued (False if duplicate batch_id)."""
         try:
             conn = self._connect()
             bid = batch_id or f"{kind}_{int(time.time() * 1000)}_{os.getpid()}"
             with self._lock:
-                conn.execute(
+                cur = conn.execute(
                     "INSERT OR IGNORE INTO outbox (batch_id, kind, payload_json, created_at, attempts) VALUES (?, ?, ?, ?, 0)",
                     (bid, kind, json.dumps(payload, default=str, separators=(",", ":")), datetime.now(UTC).isoformat()),
                 )
                 conn.commit()
-                return conn.total_changes > 0
+                return cur.rowcount > 0
         except Exception:
             logger.exception("Outbox enqueue failed kind=%s", kind)
             return False

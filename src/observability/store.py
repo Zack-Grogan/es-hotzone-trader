@@ -148,6 +148,8 @@ class ObservabilityStore:
         self,
         *,
         limit: int = 100,
+        after_id: Optional[int] = None,
+        ascending: bool = False,
         category: Optional[str] = None,
         event_type: Optional[str] = None,
         since_minutes: Optional[int] = None,
@@ -171,6 +173,9 @@ class ObservabilityStore:
             if event_type:
                 clauses.append("event_type = ?")
                 params.append(event_type)
+            if after_id is not None:
+                clauses.append("id > ?")
+                params.append(int(after_id))
             if run_id:
                 clauses.append("run_id = ?")
                 params.append(run_id)
@@ -192,9 +197,10 @@ class ObservabilityStore:
                 pattern = f"%{search}%"
                 params.extend([pattern, pattern, pattern, pattern, pattern, pattern, pattern])
             where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+            order_clause = "ORDER BY id ASC" if ascending else "ORDER BY id DESC"
             query = (
                 "SELECT id, event_timestamp, inserted_at, run_id, process_id, category, event_type, source, symbol, zone, action, reason, order_id, risk_state, payload_json "
-                f"FROM events {where} ORDER BY id DESC LIMIT ?"
+                f"FROM events {where} {order_clause} LIMIT ?"
             )
             params.append(max(int(limit), 1))
             with self._lock:
@@ -412,6 +418,8 @@ class ObservabilityStore:
         self,
         *,
         limit: int = 100,
+        after_id: Optional[int] = None,
+        ascending: bool = False,
         run_id: Optional[str] = None,
         zone: Optional[str] = None,
         strategy: Optional[str] = None,
@@ -427,6 +435,9 @@ class ObservabilityStore:
             self.start()
             clauses: list[str] = []
             params: list[Any] = []
+            if after_id is not None:
+                clauses.append("id > ?")
+                params.append(int(after_id))
             if run_id:
                 clauses.append("run_id = ?")
                 params.append(run_id)
@@ -453,6 +464,7 @@ class ObservabilityStore:
                 clauses.append("(zone LIKE ? OR strategy LIKE ? OR regime LIKE ? OR payload_json LIKE ? OR event_tags_json LIKE ?)")
                 params.extend([pattern, pattern, pattern, pattern, pattern])
             where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+            order_clause = "ORDER BY id ASC" if ascending else "ORDER BY id DESC"
             with self._lock:
                 assert self._conn is not None
                 rows = self._conn.execute(
@@ -461,7 +473,7 @@ class ObservabilityStore:
                            exit_price, pnl, zone, strategy, regime, event_tags_json, source, backfilled, payload_json
                     FROM completed_trades
                     {where}
-                    ORDER BY exit_time DESC, id DESC
+                    {order_clause}, exit_time DESC
                     LIMIT ?
                     """,
                     [*params, max(int(limit), 1)],

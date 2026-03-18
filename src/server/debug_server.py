@@ -103,6 +103,7 @@ class TradingState:
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary."""
         return {
+            'run_id': self.run_id,
             'status': self.effective_status(),
             'process_status': self.status,
             'running': self.running,
