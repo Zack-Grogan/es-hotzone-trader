@@ -81,6 +81,11 @@ class ORBStrategy(BaseStrategy):
             if zone_info:
                 self._range_start_time = zone_info.start_time or df.index[0]
             self._reset_range(df)
+
+        # Range may still be unavailable if the current zone just started and we don't have
+        # enough in-zone bars yet (even if the overall dataframe is long enough).
+        if self._range_high is None or self._range_low is None:
+            return None
         
         # Calculate ATR
         self._atr_value = atr(

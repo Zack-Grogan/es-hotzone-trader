@@ -79,6 +79,7 @@ class Account:
     account_id: str
     name: str = ""
     balance: float = 0
+    equity: float = 0
     available: float = 0
     margin_used: float = 0
     open_pnl: float = 0
@@ -143,6 +144,17 @@ class TopstepClient:
         self._on_market_data: Optional[Callable] = None
         self._on_order_update: Optional[Callable] = None
         self._on_position_update: Optional[Callable] = None
+        self._agent_debug_quote_count: int = 0
+
+        # Persistent user-hub listener (orders/positions/trades)
+        self._user_hub_ws: Optional[websockets.WebSocketClientProtocol] = None
+        self._user_hub_loop: Optional[asyncio.AbstractEventLoop] = None
+        self._user_hub_thread: Optional[threading.Thread] = None
+        self._user_hub_connected: bool = False
+        self._user_hub_stop_requested: bool = False
+        self._user_hub_reconnect_delay: float = 5.0
+        self._user_hub_max_reconnect_delay: float = 60.0
+        self._user_hub_error: Optional[str] = None
 
     def _record_event(
         self,
@@ -194,16 +206,50 @@ class TopstepClient:
             or self.account_config.require_preferred_account
         )
 
+    @staticmethod
+    def _coerce_float(value: Any, default: float = 0.0) -> float:
+        try:
+            if value is None or value == "":
+                return float(default)
+            return float(value)
+        except (TypeError, ValueError):
+            return float(default)
+
     def _account_summary(self, account: Dict[str, Any]) -> Account:
         """Map a raw API account payload into the internal representation."""
+        balance = self._coerce_float(
+            account.get("balance", account.get("cashBalance", account.get("accountBalance", 0))),
+            0.0,
+        )
+        equity = self._coerce_float(
+            account.get("equity", account.get("netLiq", account.get("netLiquidationValue", balance))),
+            balance,
+        )
+        available = self._coerce_float(
+            account.get("available", account.get("availableBalance", account.get("availableFunds", balance))),
+            balance,
+        )
+        margin_used = self._coerce_float(
+            account.get("marginUsed", account.get("marginRequirement", account.get("initialMargin", 0))),
+            0.0,
+        )
+        open_pnl = self._coerce_float(
+            account.get("openPnl", account.get("openPnL", account.get("unrealizedPnl", account.get("profitAndLoss", 0)))),
+            0.0,
+        )
+        realized_pnl = self._coerce_float(
+            account.get("realizedPnl", account.get("realizedPnL", account.get("closedProfitAndLoss", account.get("realizedProfitAndLoss", 0)))),
+            0.0,
+        )
         return Account(
             account_id=str(account.get("id")),
             name=str(account.get("name", account.get("accountId", account.get("id", "")))),
-            balance=account.get("balance", 0),
-            available=account.get("balance", 0),
-            margin_used=0,
-            open_pnl=0,
-            realized_pnl=0,
+            balance=balance,
+            equity=equity,
+            available=available,
+            margin_used=margin_used,
+            open_pnl=open_pnl,
+            realized_pnl=realized_pnl,
             is_practice=self._is_practice_account(account),
         )
 
@@ -565,7 +611,434 @@ class TopstepClient:
 
         assert last_error is not None
         raise last_error
-    
+
+    def list_accounts(self, only_active_accounts: bool = True) -> list[Dict[str, Any]]:
+        """Return tradable accounts available to the authenticated user."""
+        if not self._ensure_auth():
+            return []
+        try:
+            url = f"{self.base_url}/api/Account/search"
+            payload: Dict[str, Any] = {"onlyActiveAccounts": bool(only_active_accounts)}
+            response = self._post_with_retry(url, payload)
+            accounts = list(response.json().get("accounts", []))
+            return [dict(account) for account in accounts if account.get("canTrade")]
+        except requests.RequestException as exc:
+            logger.error("Failed to list accounts: %s", exc)
+            self._record_event(
+                category="system",
+                event_type="account_listing_failed",
+                payload={"error": str(exc)},
+                event_time=datetime.now(timezone.utc),
+                action="list_accounts",
+                reason="request_exception",
+            )
+            return []
+
+    def select_account(self, account_id: str | int, *, enforce_practice: Optional[bool] = None) -> Optional[Account]:
+        """Select an account by ID and make it active for subsequent broker operations."""
+        if not self._ensure_auth():
+            return None
+        try:
+            target_account_id = str(account_id).strip()
+            accounts = self.list_accounts(only_active_accounts=False)
+            if not accounts:
+                return None
+            account_match = next((account for account in accounts if str(account.get("id")) == target_account_id), None)
+            if account_match is None:
+                logger.error("Requested account %s not found in account search response.", target_account_id)
+                return None
+            require_practice = self._practice_account_required() if enforce_practice is None else bool(enforce_practice)
+            if require_practice and not self._is_practice_account(account_match):
+                logger.error("Refusing non-practice account switch to %s while practice-only policy is enabled.", target_account_id)
+                return None
+
+            selected = self._account_summary(account_match)
+            self._account_id = int(selected.account_id)
+            self._account = selected
+            self._mock_mode = False
+            self._record_event(
+                category="system",
+                event_type="account_selected",
+                payload={
+                    "account_id": selected.account_id,
+                    "account_name": selected.name,
+                    "balance": selected.balance,
+                    "practice": selected.is_practice,
+                    "selection_mode": "explicit",
+                },
+                event_time=datetime.now(timezone.utc),
+                action="select_account",
+                reason="account_selected",
+            )
+            return selected
+        except Exception as exc:
+            logger.error("Failed to select account %s: %s", account_id, exc)
+            return None
+
+    def get_active_account_id(self) -> Optional[int]:
+        return self._account_id
+
+    def search_orders(
+        self,
+        *,
+        start_timestamp: str,
+        end_timestamp: Optional[str] = None,
+        account_id: Optional[int] = None,
+    ) -> list[dict[str, Any]]:
+        """Search order history for an account in a time range."""
+        if not self._ensure_auth():
+            return []
+        lookup_account_id = int(account_id) if account_id is not None else self._account_id
+        if lookup_account_id is None:
+            account = self.get_account()
+            if account is None:
+                return []
+            lookup_account_id = int(account.account_id)
+        payload: Dict[str, Any] = {"accountId": lookup_account_id, "startTimestamp": start_timestamp}
+        if end_timestamp:
+            payload["endTimestamp"] = end_timestamp
+        try:
+            response = self._post_with_retry(f"{self.base_url}/api/Order/search", payload)
+            return list(response.json().get("orders", []))
+        except requests.RequestException as exc:
+            logger.error("Failed to search orders: %s", exc)
+            return []
+
+    def search_trades(
+        self,
+        *,
+        start_timestamp: str,
+        end_timestamp: Optional[str] = None,
+        account_id: Optional[int] = None,
+    ) -> list[dict[str, Any]]:
+        """Search filled trades for an account in a time range."""
+        if not self._ensure_auth():
+            return []
+        lookup_account_id = int(account_id) if account_id is not None else self._account_id
+        if lookup_account_id is None:
+            account = self.get_account()
+            if account is None:
+                return []
+            lookup_account_id = int(account.account_id)
+        payload: Dict[str, Any] = {"accountId": lookup_account_id, "startTimestamp": start_timestamp}
+        if end_timestamp:
+            payload["endTimestamp"] = end_timestamp
+        try:
+            response = self._post_with_retry(f"{self.base_url}/api/Trade/search", payload)
+            return list(response.json().get("trades", []))
+        except requests.RequestException as exc:
+            logger.error("Failed to search trades: %s", exc)
+            return []
+
+    def modify_order(
+        self,
+        order_id: str | int,
+        *,
+        size: Optional[int] = None,
+        limit_price: Optional[float] = None,
+        stop_price: Optional[float] = None,
+        trail_price: Optional[float] = None,
+        account_id: Optional[int] = None,
+    ) -> bool:
+        """Modify an open order."""
+        if not self._ensure_auth():
+            return False
+        lookup_account_id = int(account_id) if account_id is not None else self._account_id
+        if lookup_account_id is None:
+            return False
+        payload: Dict[str, Any] = {"accountId": lookup_account_id, "orderId": int(order_id)}
+        if size is not None:
+            payload["size"] = int(size)
+        if limit_price is not None:
+            payload["limitPrice"] = float(limit_price)
+        if stop_price is not None:
+            payload["stopPrice"] = float(stop_price)
+        if trail_price is not None:
+            payload["trailPrice"] = float(trail_price)
+        try:
+            response = self._post_with_retry(f"{self.base_url}/api/Order/modify", payload)
+            data = response.json()
+            return bool(data.get("success"))
+        except requests.RequestException as exc:
+            logger.error("Failed to modify order %s: %s", order_id, exc)
+            return False
+
+    def close_position(self, contract_id: str, *, account_id: Optional[int] = None) -> bool:
+        """Close an open position for a specific contract."""
+        if not self._ensure_auth():
+            return False
+        lookup_account_id = int(account_id) if account_id is not None else self._account_id
+        if lookup_account_id is None:
+            return False
+        payload = {"accountId": lookup_account_id, "contractId": str(contract_id)}
+        try:
+            response = self._post_with_retry(f"{self.base_url}/api/Position/closeContract", payload)
+            data = response.json()
+            return bool(data.get("success"))
+        except requests.RequestException as exc:
+            logger.error("Failed to close position for contract %s: %s", contract_id, exc)
+            return False
+
+    async def _invoke_user_hub(self, invocations: list[tuple[str, list[Any]]]) -> bool:
+        if not self._ensure_auth():
+            return False
+        try:
+            ws = await websockets.connect(
+                self._build_hub_url(self.user_hub_url),
+                open_timeout=self.config.timeout,
+                ping_interval=20,
+                ping_timeout=20,
+                close_timeout=10,
+            )
+            await ws.send(json.dumps({"protocol": "json", "version": 1}) + "\x1e")
+            raw = await asyncio.wait_for(ws.recv(), timeout=5)
+            for frame in self._decode_signalr_frames(raw):
+                if frame.get("error"):
+                    raise RuntimeError(str(frame["error"]))
+            invocation_id = 1
+            for target, args in invocations:
+                frame = {
+                    "type": 1,
+                    "target": target,
+                    "arguments": list(args),
+                    "invocationId": str(invocation_id),
+                }
+                invocation_id += 1
+                await ws.send(json.dumps(frame) + "\x1e")
+            await asyncio.sleep(0.1)
+            await ws.close()
+            return True
+        except Exception as exc:
+            logger.error("User hub invocation failed: %s", exc)
+            return False
+
+    def _run_async(self, coroutine) -> bool:
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return bool(asyncio.run(coroutine))
+
+        result: dict[str, bool] = {"ok": False}
+
+        def _runner() -> None:
+            loop = asyncio.new_event_loop()
+            try:
+                asyncio.set_event_loop(loop)
+                result["ok"] = bool(loop.run_until_complete(coroutine))
+            finally:
+                loop.close()
+
+        thread = threading.Thread(target=_runner, daemon=True)
+        thread.start()
+        thread.join(timeout=max(float(self.config.timeout), 5.0))
+        return bool(result["ok"])
+
+    def subscribe_user_updates(self, account_id: Optional[int] = None) -> bool:
+        """Subscribe user-hub channels for accounts, orders, positions, and trades."""
+        lookup_account_id = int(account_id) if account_id is not None else self._account_id
+        if lookup_account_id is None:
+            account = self.get_account()
+            if account is None:
+                return False
+            lookup_account_id = int(account.account_id)
+        return self._run_async(
+            self._invoke_user_hub(
+                [
+                    ("SubscribeAccounts", []),
+                    ("SubscribeOrders", [lookup_account_id]),
+                    ("SubscribePositions", [lookup_account_id]),
+                    ("SubscribeTrades", [lookup_account_id]),
+                ]
+            )
+        )
+
+    def unsubscribe_user_updates(self, account_id: Optional[int] = None) -> bool:
+        """Unsubscribe user-hub channels for accounts, orders, positions, and trades."""
+        lookup_account_id = int(account_id) if account_id is not None else self._account_id
+        if lookup_account_id is None:
+            return False
+        return self._run_async(
+            self._invoke_user_hub(
+                [
+                    ("UnsubscribeAccounts", []),
+                    ("UnsubscribeOrders", [lookup_account_id]),
+                    ("UnsubscribePositions", [lookup_account_id]),
+                    ("UnsubscribeTrades", [lookup_account_id]),
+                ]
+            )
+        )
+
+    async def _user_hub_connect(self) -> None:
+        """Open persistent user-hub WebSocket, handshake, and subscribe to orders/positions."""
+        if not self._ensure_auth():
+            raise RuntimeError("User hub requires authentication")
+        lookup_account_id = self._account_id
+        if lookup_account_id is None:
+            acc = self.get_account()
+            if acc is None:
+                raise RuntimeError("No account for user hub subscription")
+            lookup_account_id = int(acc.account_id)
+        self._user_hub_ws = await websockets.connect(
+            self._build_hub_url(self.user_hub_url),
+            open_timeout=self.config.timeout,
+            ping_interval=20,
+            ping_timeout=20,
+            close_timeout=10,
+        )
+        await self._user_hub_ws.send(json.dumps({"protocol": "json", "version": 1}) + "\x1e")
+        raw = await asyncio.wait_for(self._user_hub_ws.recv(), timeout=5)
+        for frame in self._decode_signalr_frames(raw):
+            if frame.get("error"):
+                raise RuntimeError(str(frame["error"]))
+        for target, args in [
+            ("SubscribeAccounts", []),
+            ("SubscribeOrders", [lookup_account_id]),
+            ("SubscribePositions", [lookup_account_id]),
+            ("SubscribeTrades", [lookup_account_id]),
+        ]:
+            inv = {"type": 1, "target": target, "arguments": list(args), "invocationId": str(id(self._user_hub_ws))}
+            await self._user_hub_ws.send(json.dumps(inv) + "\x1e")
+        await asyncio.sleep(0.2)
+        self._user_hub_connected = True
+        self._user_hub_error = None
+        logger.info("User hub connected and subscribed for account %s", lookup_account_id)
+        self._record_event(
+            category="market",
+            event_type="user_hub_connected",
+            payload={"account_id": lookup_account_id},
+            event_time=datetime.now(timezone.utc),
+            action="user_hub_connect",
+            reason="user_hub_connected",
+        )
+
+    def _handle_user_hub_message(self, data: Dict[str, Any]) -> None:
+        """Dispatch user-hub invocation to order/position callbacks."""
+        if data.get("type") != 1:
+            return
+        target = str(data.get("target", "")).lower()
+        arguments = list(data.get("arguments", []))
+        payload = self._coerce_signalr_payload(arguments[0] if arguments else data)
+        if not payload:
+            return
+        order_targets = ("orderupdated", "orderupdate", "order", "onorderupdate")
+        position_targets = ("positionupdated", "positionupdate", "position", "onpositionupdate")
+        if target in order_targets and self._on_order_update:
+            order_id = payload.get("orderId") or payload.get("id") or payload.get("orderID")
+            status = payload.get("status") or payload.get("orderStatus") or payload.get("state")
+            if order_id is not None:
+                normalized = {
+                    "orderId": order_id,
+                    "id": order_id,
+                    "status": str(status or "").lower(),
+                    "filledQuantity": payload.get("filledQuantity", payload.get("filled_quantity", 0)),
+                    "filledPrice": payload.get("filledPrice", payload.get("filled_price", 0.0)),
+                }
+                try:
+                    self._on_order_update(normalized)
+                except Exception as exc:
+                    logger.warning("on_order_update callback error: %s", exc)
+        if target in position_targets and self._on_position_update:
+            try:
+                self._on_position_update(payload)
+            except Exception as exc:
+                logger.warning("on_position_update callback error: %s", exc)
+
+    async def _user_hub_listen(self) -> None:
+        """Listen to user-hub WebSocket and dispatch messages."""
+        if not self._user_hub_ws:
+            return
+        try:
+            async for message in self._user_hub_ws:
+                for frame in self._decode_signalr_frames(message):
+                    if frame.get("type") == 7:
+                        raise RuntimeError(str(frame.get("error", "SignalR closed")))
+                    self._handle_user_hub_message(frame)
+        except Exception as e:
+            self._user_hub_connected = False
+            self._user_hub_error = str(e)
+            logger.warning("User hub listen error: %s", e)
+            self._record_event(
+                category="market",
+                event_type="user_hub_listen_error",
+                payload={"error": str(e)},
+                event_time=datetime.now(timezone.utc),
+                action="user_hub_listen",
+                reason="user_hub_listen_error",
+            )
+            raise
+
+    async def _user_hub_run_loop(self) -> None:
+        """Connect and listen with reconnect and backoff."""
+        delay = self._user_hub_reconnect_delay
+        while not self._user_hub_stop_requested:
+            try:
+                await self._user_hub_connect()
+                delay = self._user_hub_reconnect_delay
+                await self._user_hub_listen()
+            except Exception as e:
+                self._user_hub_connected = False
+                self._user_hub_error = str(e)
+                if self._user_hub_stop_requested:
+                    break
+                logger.warning("User hub disconnected, reconnecting in %.1fs: %s", delay, e)
+                await asyncio.sleep(delay)
+                delay = min(delay * 1.5, self._user_hub_max_reconnect_delay)
+        self._user_hub_connected = False
+
+    def start_user_hub_listener(self) -> None:
+        """Start persistent user-hub listener in a background thread."""
+        if self._mock_mode or (self._on_order_update is None and self._on_position_update is None):
+            return
+        if self._user_hub_thread and self._user_hub_thread.is_alive():
+            return
+        self._user_hub_stop_requested = False
+        self._user_hub_error = None
+
+        def run():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            self._user_hub_loop = loop
+            try:
+                loop.run_until_complete(self._user_hub_run_loop())
+            except Exception:
+                logger.exception("User hub thread terminated")
+            finally:
+                self._user_hub_connected = False
+                self._user_hub_loop = None
+
+        self._user_hub_thread = threading.Thread(target=run, name="user-hub-listener", daemon=True)
+        self._user_hub_thread.start()
+
+    def stop_user_hub_listener(self) -> None:
+        """Stop user-hub listener and close connection."""
+        self._user_hub_stop_requested = True
+        if self._user_hub_ws and self._user_hub_loop and self._user_hub_loop.is_running():
+            try:
+                asyncio.run_coroutine_threadsafe(self._user_hub_ws.close(), self._user_hub_loop).result(timeout=5)
+            except Exception:
+                pass
+        self._user_hub_ws = None
+        if self._user_hub_thread:
+            self._user_hub_thread.join(timeout=5)
+            self._user_hub_thread = None
+        self._user_hub_connected = False
+        self._record_event(
+            category="market",
+            event_type="user_hub_stopped",
+            payload={},
+            event_time=datetime.now(timezone.utc),
+            action="stop_user_hub",
+            reason="user_hub_stopped",
+        )
+
+    def is_user_hub_connected(self) -> bool:
+        """Return whether the persistent user-hub connection is active."""
+        return self._user_hub_connected
+
+    def get_user_hub_error(self) -> Optional[str]:
+        """Return last user-hub error if any."""
+        return self._user_hub_error
+
     def get_account(self) -> Optional[Account]:
         """Get account information."""
         if not self._ensure_auth():
@@ -623,8 +1096,13 @@ class TopstepClient:
     
     def get_positions(self) -> Dict[str, Position]:
         """Get current positions."""
+        positions, _ = self.get_positions_snapshot()
+        return positions or {}
+
+    def get_positions_snapshot(self) -> tuple[Optional[Dict[str, Position]], Optional[str]]:
+        """Get broker position state with explicit success/failure status."""
         if not self._ensure_auth() or not self._account_id:
-            return {}
+            return None, "auth_unavailable"
         
         try:
             url = f"{self.base_url}/api/Position/searchOpen"
@@ -649,7 +1127,7 @@ class TopstepClient:
                 )
             with self._state_lock:
                 self._positions = new_positions
-                return dict(self._positions)
+                return dict(self._positions), None
             
         except requests.RequestException as e:
             logger.error("Failed to get positions: %s", e)
@@ -662,16 +1140,63 @@ class TopstepClient:
                 action="get_positions",
                 reason="request_exception",
             )
-            return {}
-    
+            return None, str(e)
+
+    def get_open_orders_snapshot(self, symbol: Optional[str] = None) -> tuple[Optional[list[dict[str, Any]]], Optional[str]]:
+        """Get broker open orders with explicit success/failure status."""
+        if not self._ensure_auth() or not self._account_id:
+            return None, "auth_unavailable"
+
+        payload: dict[str, Any] = {"accountId": self._account_id}
+        contract_id: Optional[str] = None
+        if symbol:
+            contract_id = self._resolve_contract_id(symbol)
+            if not contract_id:
+                return None, "contract_resolution_failed"
+            payload["contractId"] = contract_id
+
+        try:
+            url = f"{self.base_url}/api/Order/searchOpen"
+            response = self._post_with_retry(url, payload)
+            data = response.json()
+            orders = list(data.get("orders", []))
+            normalized = self._normalize_symbol(symbol or self._stream_symbol)
+            filtered_orders: list[dict[str, Any]] = []
+            for order in orders:
+                order_contract_id = str(order.get("contractId", ""))
+                if symbol:
+                    if contract_id and order_contract_id and order_contract_id == contract_id:
+                        filtered_orders.append(order)
+                        continue
+                    order_symbol = self._normalize_symbol(
+                        str(order.get("symbol", order.get("symbolName", order.get("contractName", ""))))
+                    )
+                    if order_symbol and order_symbol == normalized:
+                        filtered_orders.append(order)
+                else:
+                    filtered_orders.append(order)
+            return filtered_orders, None
+        except requests.RequestException as e:
+            logger.error("Failed to get open orders: %s", e)
+            self._record_event(
+                category="execution",
+                event_type="open_order_lookup_failed",
+                payload={"error": str(e), "account_id": self._account_id, "symbol": symbol},
+                event_time=datetime.now(timezone.utc),
+                symbol=symbol or self._stream_symbol,
+                action="get_open_orders",
+                reason="request_exception",
+            )
+            return None, str(e)
+
     def get_position(self, symbol: str = "ES") -> Position:
         """Get position for specific symbol."""
-        positions = self.get_positions()
-        if symbol in positions:
+        positions, _ = self.get_positions_snapshot()
+        if positions and symbol in positions:
             return positions[symbol]
 
         requested = symbol.upper()
-        for contract_id, position in positions.items():
+        for contract_id, position in (positions or {}).items():
             normalized = str(contract_id).upper()
             if requested in normalized or normalized in requested:
                 return position
@@ -995,6 +1520,14 @@ class TopstepClient:
 
             if self._on_market_data:
                 self._on_market_data(quote)
+            self._agent_debug_quote_count += 1
+            if self._agent_debug_quote_count % 300 == 0:
+                logger.info(
+                    "market_stream_heartbeat symbol=%s quotes=%s last_price=%s",
+                    root_symbol,
+                    self._agent_debug_quote_count,
+                    quote.last or quote.mid,
+                )
 
         elif target == "GatewayTrade" and len(arguments) >= 2:
             contract_id = str(arguments[0])
@@ -1085,6 +1618,7 @@ class TopstepClient:
         
         self._ws_thread = threading.Thread(target=run_ws, name=f"market-stream-{symbol.lower()}", daemon=True)
         self._ws_thread.start()
+        self.start_user_hub_listener()
         self._record_event(
             category="market",
             event_type="market_stream_started",
@@ -1094,9 +1628,10 @@ class TopstepClient:
             action="start_stream",
             reason="market_stream_started",
         )
-    
+
     def stop_market_stream(self):
-        """Stop market data streaming."""
+        """Stop market data streaming and user-hub listener."""
+        self.stop_user_hub_listener()
         thread_alive_after_join = False
         if self._ws and self._ws_loop and self._ws_loop.is_running():
             future = asyncio.run_coroutine_threadsafe(self._ws.close(), self._ws_loop)
@@ -1172,11 +1707,11 @@ class TopstepClient:
         """Get current market data for symbol."""
         return self._lookup_market_snapshot(symbol)
     
-    # Mock/Backtest mode for development
-    
+    # Offline execution (replay and tests only)
+
     def enable_mock_mode(self):
-        """Enable mock mode for testing without API."""
-        logger.info("Mock mode enabled")
+        """Enable offline execution: no real API calls; synthetic account and data. Used only by replay and tests. Practice account = real Topstep PRAC (use start, not this)."""
+        logger.info("Offline execution enabled (replay/tests only)")
         self._mock_mode = True
         self._account = Account(account_id="SIM-PRAC", name="Practice Sim", balance=50000, is_practice=True)
         self._record_event(

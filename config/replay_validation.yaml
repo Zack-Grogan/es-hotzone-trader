@@ -1,0 +1,57 @@
+# Minimal config for end-to-end replay validation.
+# Uses dataclass defaults for most settings, but enables more permissive entries
+# and allows trading outside configured hot-zones so synthetic data produces orders.
+
+account:
+  capital: 50000
+  max_contracts: 5
+  default_contracts: 1
+  preferred_id_match: "PRAC"
+  require_preferred_account: true
+
+symbols:
+  - ES
+
+hot_zones:
+  - name: "Pre-Open"
+    start: "06:30"
+    end: "08:30"
+    timezone: "America/Chicago"
+    enabled: true
+  - name: "Post-Open"
+    start: "09:00"
+    end: "11:00"
+    timezone: "America/Chicago"
+    enabled: true
+  - name: "Midday"
+    start: "12:00"
+    end: "13:00"
+    timezone: "America/Chicago"
+    enabled: true
+  - name: "Close-Scalp"
+    start: "12:45"
+    end: "13:00"
+    timezone: "America/Chicago"
+    mode: "flatten_only"
+    enabled: true
+
+sessions:
+  timezone: "America/Chicago"
+
+strategy:
+  trade_outside_hotzones: true
+
+alpha:
+  # Force the matrix to generate entries even on synthetic/low-signal data so we
+  # can validate order/trade/event plumbing end-to-end.
+  min_entry_score: 0.0
+  min_score_gap: -999.0
+  full_size_score: 0.0
+  flat_bias_buffer: -100.0
+  exit_decay_score: 0.1
+  # Disable vetoes so we can validate order/event plumbing end-to-end.
+  zone_vetoes: {}
+
+risk:
+  enable_circuit_breakers: false
+

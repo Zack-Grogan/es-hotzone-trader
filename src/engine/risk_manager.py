@@ -3,7 +3,7 @@ import logging
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from enum import Enum
-from typing import Optional, List
+from typing import Any, Dict, List, Optional, Tuple
 from collections import deque
 
 import pytz
@@ -403,6 +403,45 @@ class RiskManager:
             contracts = 0
         
         return contracts
+
+    def calculate_position_size_with_telemetry(
+        self,
+        atr_value: float,
+        direction: int = 1,
+    ) -> Tuple[int, Dict[str, Any]]:
+        """
+        Calculate position size and return telemetry (inputs and guardrail reasons).
+        Returns (contracts, telemetry_dict).
+        """
+        telemetry: Dict[str, Any] = {
+            "atr_value": atr_value,
+            "risk_per_contract": self.account_config.risk_per_contract,
+            "risk_per_point": None,
+            "base_contracts": None,
+            "reduced_risk": self._risk_state == RiskState.REDUCED,
+            "circuit_breaker": self._risk_state == RiskState.CIRCUIT_BREAKER,
+            "guardrail_reasons": [],
+        }
+        if atr_value <= 0:
+            telemetry["base_contracts"] = self.account_config.default_contracts
+            telemetry["guardrail_reasons"].append("atr_zero_use_default")
+            return self.account_config.default_contracts, telemetry
+        risk_per_contract = self.account_config.risk_per_contract
+        risk_per_point = atr_value * 50
+        telemetry["risk_per_point"] = risk_per_point
+        base = int(risk_per_contract / risk_per_point) if risk_per_point > 0 else 1
+        base = max(1, min(base, self.account_config.max_contracts))
+        telemetry["base_contracts"] = base
+        contracts = base
+        if self._risk_state == RiskState.REDUCED:
+            contracts = min(contracts, 2)
+            telemetry["guardrail_reasons"].append("reduced_risk_cap")
+        elif self._risk_state == RiskState.CIRCUIT_BREAKER:
+            contracts = 0
+            telemetry["guardrail_reasons"].append("circuit_breaker")
+        if contracts >= self.account_config.max_contracts and base >= self.account_config.max_contracts:
+            telemetry["guardrail_reasons"].append("max_contracts_cap")
+        return contracts, telemetry
     
     def calculate_stop_distance(self, atr_value: float, multiplier: float = 2.0) -> float:
         """

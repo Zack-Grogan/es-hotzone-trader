@@ -342,6 +342,31 @@ class ObservabilityStore:
             logger.exception("Failed to load run manifest for run_id=%s", run_id)
             return None
 
+    def update_run_manifest_payload(self, run_id: str, extra: dict[str, Any]) -> None:
+        """Merge extra keys into the payload_json of an existing run manifest."""
+        if not self.enabled() or not extra:
+            return
+        try:
+            self.start()
+            with self._lock:
+                assert self._conn is not None
+                row = self._conn.execute(
+                    "SELECT payload_json FROM run_manifests WHERE run_id = ?",
+                    (run_id,),
+                ).fetchone()
+                if row is None:
+                    return
+                payload = json.loads(row["payload_json"] or "{}")
+                payload.update(self._normalize_value(extra))
+                self._conn.execute(
+                    "UPDATE run_manifests SET payload_json = ? WHERE run_id = ?",
+                    (self._json_dumps(payload), run_id),
+                )
+                self._conn.commit()
+        except Exception:
+            self._failed = True
+            logger.exception("Failed to update run manifest payload for run_id=%s", run_id)
+
     def record_completed_trade(
         self,
         trade: Any,

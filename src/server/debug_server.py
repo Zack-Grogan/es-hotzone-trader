@@ -3,14 +3,12 @@ from datetime import UTC, datetime
 import json
 import logging
 import threading
-import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, Optional
 from urllib.parse import urlparse
 
 from src.config import get_config, ServerConfig
 from src.observability import get_observability_store
-from src.server.mcp_server import get_mcp_http_metadata, handle_mcp_request
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +27,11 @@ class TradingState:
         self.position_pnl: float = 0
         self.daily_pnl: float = 0
         self.account_balance: float = 50000
+        self.account_equity: float = 0
+        self.account_available: float = 0
+        self.account_margin_used: float = 0
+        self.account_open_pnl: float = 0
+        self.account_realized_pnl: float = 0
         self.account_id: Optional[str] = None
         self.account_name: Optional[str] = None
         self.account_is_practice: Optional[bool] = None
@@ -56,6 +59,9 @@ class TradingState:
         self.start_time: float = 0
         self.risk_state: str = "normal"
         self.trades_today: int = 0
+        self.trades_this_hour: int = 0
+        self.trades_this_zone: int = 0
+        self.max_daily_loss: float = 0
         self.consecutive_losses: int = 0
         self.errors: list = []
         self.run_id: Optional[str] = None
@@ -67,6 +73,7 @@ class TradingState:
         self.observability_db_path: Optional[str] = None
         self.mcp_url: Optional[str] = None
         self.last_backfill: Optional[Dict[str, Any]] = None
+        self.lifecycle: Dict[str, Any] = {}
 
     def effective_status(self) -> str:
         """Derive an externally meaningful status from runtime state."""
@@ -76,7 +83,7 @@ class TradingState:
 
         if not self.running:
             return raw_status
-        if mode in {"mock", "replay"}:
+        if mode == "replay":
             return mode
         if raw_status not in {"running", "healthy"}:
             return raw_status
@@ -130,12 +137,20 @@ class TradingState:
                 'id': self.account_id,
                 'name': self.account_name,
                 'balance': self.account_balance,
+                'equity': self.account_equity,
+                'available': self.account_available,
+                'margin_used': self.account_margin_used,
+                'open_pnl': self.account_open_pnl,
+                'realized_pnl': self.account_realized_pnl,
                 'daily_pnl': self.daily_pnl,
                 'is_practice': self.account_is_practice,
             },
             'risk': {
                 'state': self.risk_state,
                 'trades_today': self.trades_today,
+                'trades_this_hour': self.trades_this_hour,
+                'trades_this_zone': self.trades_this_zone,
+                'max_daily_loss': self.max_daily_loss,
                 'consecutive_losses': self.consecutive_losses
             },
             'execution': self.execution,
@@ -146,6 +161,7 @@ class TradingState:
             'last_price': self.last_price,
             'uptime_seconds': self.uptime_seconds,
             'errors': self.errors[-10:],
+            'lifecycle': self.lifecycle,
             'observability': {
                 'run_id': self.run_id,
                 'code_version': self.code_version,
@@ -230,11 +246,16 @@ class HealthHandler(BaseHTTPRequestHandler):
 class DebugHandler(BaseHTTPRequestHandler):
     """Debug endpoint handler."""
 
-    def _write_json_response(self, status: int, payload: Dict[str, Any]) -> None:
+    def _write_json_response(self, status: int, payload: Optional[Dict[str, Any]], headers: Optional[Dict[str, str]] = None) -> None:
         self.send_response(status)
-        self.send_header('Content-Type', 'application/json')
+        if headers:
+            for name, value in headers.items():
+                self.send_header(name, value)
+        if payload is not None:
+            self.send_header('Content-Type', 'application/json')
         self.end_headers()
-        self.wfile.write(json.dumps(payload, indent=2, default=str).encode())
+        if payload is not None:
+            self.wfile.write(json.dumps(payload, indent=2, default=str).encode())
 
     def do_GET(self):
         """Handle GET request."""
@@ -242,29 +263,13 @@ class DebugHandler(BaseHTTPRequestHandler):
         if path == '/debug' or path == '/':
             self._write_json_response(200, _state.to_dict())
             return
-        config = get_config().server
-        if config.mcp_enabled and path == config.mcp_path:
-            self._write_json_response(200, get_mcp_http_metadata(config.mcp_path))
-            return
         self.send_response(404)
         self.end_headers()
 
     def do_POST(self):
-        path = urlparse(self.path).path
-        config = get_config().server
-        if not config.mcp_enabled or path != config.mcp_path:
-            self.send_response(404)
-            self.end_headers()
-            return
-        content_length = int(self.headers.get('Content-Length', '0'))
-        raw_body = self.rfile.read(content_length) if content_length > 0 else b'{}'
-        try:
-            request = json.loads(raw_body.decode('utf-8') or '{}')
-        except json.JSONDecodeError:
-            self._write_json_response(400, {"error": "Invalid JSON body"})
-            return
-        status, response = handle_mcp_request(request, get_state)
-        self._write_json_response(status, response)
+        """Debug server has no POST endpoints; MCP runs on Railway."""
+        self.send_response(404)
+        self.end_headers()
 
     def log_message(self, format, *args):
         pass
@@ -286,9 +291,10 @@ class DebugServer:
         self.health_port = self.config.health_port
         self.debug_port = self.config.debug_port
         
-        self._health_server: Optional[HTTPServer] = None
-        self._debug_server: Optional[HTTPServer] = None
-        self._thread: Optional[threading.Thread] = None
+        self._health_server: Optional[ThreadingHTTPServer] = None
+        self._debug_server: Optional[ThreadingHTTPServer] = None
+        self._health_thread: Optional[threading.Thread] = None
+        self._debug_thread: Optional[threading.Thread] = None
         self._running = False
     
     def start(self):
@@ -297,45 +303,39 @@ class DebugServer:
             return
         
         # Start health server
-        self._health_server = HTTPServer((self.host, self.health_port), HealthHandler)
-        self._health_server.timeout = 0.5
+        self._health_server = ThreadingHTTPServer((self.host, self.health_port), HealthHandler)
         logger.info(f"Health server started on {self.host}:{self.health_port}")
         
         # Start debug server
-        self._debug_server = HTTPServer((self.host, self.debug_port), DebugHandler)
-        self._debug_server.timeout = 0.5
+        self._debug_server = ThreadingHTTPServer((self.host, self.debug_port), DebugHandler)
         logger.info(f"Debug server started on {self.host}:{self.debug_port}")
-        if self.config.mcp_enabled:
-            logger.info("MCP endpoint started on http://%s:%s%s", self.host, self.debug_port, self.config.mcp_path)
-        
-        # Start server thread
-        def run_servers():
-            while self._running:
-                if self._health_server:
-                    self._health_server.handle_request()
-                if self._debug_server and self._running:
-                    self._debug_server.handle_request()
-        
+
         self._running = True
-        self._thread = threading.Thread(target=run_servers, daemon=True)
-        self._thread.start()
+        self._health_thread = threading.Thread(target=self._health_server.serve_forever, kwargs={"poll_interval": 0.25}, daemon=True)
+        self._debug_thread = threading.Thread(target=self._debug_server.serve_forever, kwargs={"poll_interval": 0.25}, daemon=True)
+        self._health_thread.start()
+        self._debug_thread.start()
     
     def stop(self):
         """Stop servers."""
         self._running = False
 
-        thread = self._thread
-        if thread and thread.is_alive():
-            thread.join(timeout=2)
-        self._thread = None
-
         if self._health_server:
+            self._health_server.shutdown()
             self._health_server.server_close()
             self._health_server = None
 
         if self._debug_server:
+            self._debug_server.shutdown()
             self._debug_server.server_close()
             self._debug_server = None
+
+        if self._health_thread and self._health_thread.is_alive():
+            self._health_thread.join(timeout=2)
+        if self._debug_thread and self._debug_thread.is_alive():
+            self._debug_thread.join(timeout=2)
+        self._health_thread = None
+        self._debug_thread = None
 
         logger.info("Debug servers stopped")
 

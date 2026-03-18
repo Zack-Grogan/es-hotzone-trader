@@ -1,12 +1,17 @@
 """CLI commands module."""
 import click
+from datetime import UTC, datetime
 import logging
 import json
 from logging.handlers import RotatingFileHandler
+import os
 from pathlib import Path
+import requests
+import signal
 import sys
 import threading
-from typing import Optional
+import time
+from typing import Any, Optional
 
 from src.config import get_config, load_config, set_config
 from src.server import get_server, get_state, set_state
@@ -15,6 +20,7 @@ from src.execution import get_executor
 from src.engine import ReplayRunner, get_scheduler, get_risk_manager, get_trading_engine
 from src.observability import get_observability_store
 from src.observability.provenance import collect_run_provenance
+from src.bridge import start_railway_bridge
 
 logger = logging.getLogger(__name__)
 
@@ -81,11 +87,20 @@ def _log_thread_exception(args: threading.ExceptHookArgs) -> None:
     )
 
 
-def _configure_logging(cfg) -> Path:
+def _utc_now() -> datetime:
+    return datetime.now(UTC)
+
+
+def _resolve_log_path(cfg) -> Path:
     project_root = Path(__file__).resolve().parent.parent.parent
     log_path = Path(cfg.logging.file)
     if not log_path.is_absolute():
         log_path = project_root / log_path
+    return log_path
+
+
+def _configure_logging(cfg) -> Path:
+    log_path = _resolve_log_path(cfg)
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
     root_logger = logging.getLogger()
@@ -129,23 +144,432 @@ def _configure_logging(cfg) -> Path:
     return log_path
 
 
+def _runtime_control_paths(cfg, log_path: Optional[Path] = None) -> dict[str, Path]:
+    resolved_log_path = log_path or _resolve_log_path(cfg)
+    runtime_dir = resolved_log_path.parent / "runtime"
+    return {
+        "runtime_dir": runtime_dir,
+        "pid_file": runtime_dir / "trader.pid",
+        "request_file": runtime_dir / "lifecycle_request.json",
+        "status_file": runtime_dir / "runtime_status.json",
+    }
+
+
+def _write_json_file(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_name(f".{path.name}.tmp")
+    temp_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    temp_path.replace(path)
+
+
+def _read_json_file(path: Path) -> Optional[dict[str, Any]]:
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        logger.warning("Failed to read JSON file at %s", path, exc_info=True)
+        return None
+
+
+def _pid_is_running(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _read_pid_file(path: Path) -> Optional[int]:
+    if not path.exists():
+        return None
+    try:
+        return int(path.read_text(encoding="utf-8").strip())
+    except Exception:
+        logger.warning("Failed to parse pid file at %s", path, exc_info=True)
+        return None
+
+
+def _write_pid_file(path: Path, pid: int) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"{pid}\n", encoding="utf-8")
+
+
+def _remove_file_if_exists(path: Path) -> None:
+    try:
+        if path.exists():
+            path.unlink()
+    except Exception:
+        logger.warning("Failed to remove file at %s", path, exc_info=True)
+
+
+def _build_lifecycle_request(*, action: str, reason: str, source: str) -> dict[str, Any]:
+    requested_at = _utc_now().isoformat()
+    return {
+        "request_id": f"{int(time.time())}-{os.getpid()}-{action}",
+        "action": action,
+        "reason": reason,
+        "source": source,
+        "requester_pid": os.getpid(),
+        "requested_at": requested_at,
+    }
+
+
+def _read_lifecycle_request(cfg, log_path: Optional[Path] = None) -> Optional[dict[str, Any]]:
+    return _read_json_file(_runtime_control_paths(cfg, log_path)["request_file"])
+
+
+def _write_lifecycle_request(cfg, payload: dict[str, Any], log_path: Optional[Path] = None) -> Path:
+    path = _runtime_control_paths(cfg, log_path)["request_file"]
+    _write_json_file(path, payload)
+    return path
+
+
+def _clear_lifecycle_request(cfg, log_path: Optional[Path] = None) -> None:
+    _remove_file_if_exists(_runtime_control_paths(cfg, log_path)["request_file"])
+
+
+def _write_runtime_status(
+    cfg,
+    *,
+    log_path: Path,
+    phase: str,
+    config_path: str,
+    running: bool,
+    data_mode: str,
+    lifecycle_request: Optional[dict[str, Any]] = None,
+    run_id: Optional[str] = None,
+    status: Optional[str] = None,
+) -> dict[str, Any]:
+    payload = {
+        "phase": phase,
+        "status": status or phase,
+        "pid": os.getpid(),
+        "running": running,
+        "data_mode": data_mode,
+        "config_path": config_path,
+        "log_path": str(log_path),
+        "run_id": run_id,
+        "updated_at": _utc_now().isoformat(),
+        "lifecycle_request": lifecycle_request,
+    }
+    _write_json_file(_runtime_control_paths(cfg, log_path)["status_file"], payload)
+    return payload
+
+
+def _read_runtime_status(cfg, log_path: Optional[Path] = None) -> Optional[dict[str, Any]]:
+    return _read_json_file(_runtime_control_paths(cfg, log_path)["status_file"])
+
+
+def _mark_runtime_active(cfg, *, log_path: Path, config_path: str, data_mode: str, lifecycle_request: Optional[dict[str, Any]] = None) -> None:
+    paths = _runtime_control_paths(cfg, log_path)
+    _write_pid_file(paths["pid_file"], os.getpid())
+    _write_runtime_status(
+        cfg,
+        log_path=log_path,
+        phase="starting",
+        config_path=config_path,
+        running=True,
+        data_mode=data_mode,
+        lifecycle_request=lifecycle_request,
+        status="starting",
+    )
+
+
+def _mark_runtime_phase(
+    cfg,
+    *,
+    log_path: Path,
+    config_path: str,
+    data_mode: str,
+    phase: str,
+    running: bool,
+    lifecycle_request: Optional[dict[str, Any]] = None,
+    run_id: Optional[str] = None,
+    status: Optional[str] = None,
+) -> None:
+    _write_runtime_status(
+        cfg,
+        log_path=log_path,
+        phase=phase,
+        config_path=config_path,
+        running=running,
+        data_mode=data_mode,
+        lifecycle_request=lifecycle_request,
+        run_id=run_id,
+        status=status,
+    )
+
+
+def _mark_runtime_inactive(
+    cfg,
+    *,
+    log_path: Path,
+    config_path: str,
+    data_mode: str,
+    lifecycle_request: Optional[dict[str, Any]] = None,
+    run_id: Optional[str] = None,
+    status: str = "stopped",
+) -> None:
+    paths = _runtime_control_paths(cfg, log_path)
+    _remove_file_if_exists(paths["pid_file"])
+    _write_runtime_status(
+        cfg,
+        log_path=log_path,
+        phase="stopped" if status == "stopped" else "error",
+        config_path=config_path,
+        running=False,
+        data_mode=data_mode,
+        lifecycle_request=lifecycle_request,
+        run_id=run_id,
+        status=status,
+    )
+
+
+def _set_lifecycle_state(**updates: Any) -> dict[str, Any]:
+    current = dict(getattr(get_state(), "lifecycle", {}) or {})
+    current.update(updates)
+    set_state(lifecycle=current)
+    return current
+
+
+def _ensure_runtime_is_not_active(cfg, *, log_path: Path) -> None:
+    paths = _runtime_control_paths(cfg, log_path)
+    active_pid = _read_pid_file(paths["pid_file"])
+    if active_pid is not None and _pid_is_running(active_pid):
+        raise click.ClickException(f"ES Hot-Zone Trader is already running with PID {active_pid}.")
+    if active_pid is not None:
+        _remove_file_if_exists(paths["pid_file"])
+
+
+def _resolve_shutdown_request(
+    cfg,
+    *,
+    log_path: Path,
+    fallback_reason: str,
+    fallback_action: str = "stop",
+    signal_name: Optional[str] = None,
+) -> dict[str, Any]:
+    request = _read_lifecycle_request(cfg, log_path) or {}
+    return {
+        "request_id": request.get("request_id"),
+        "requested_action": request.get("action") or fallback_action,
+        "operator_reason": request.get("reason") or fallback_reason,
+        "request_source": request.get("source"),
+        "requester_pid": request.get("requester_pid"),
+        "requested_at": request.get("requested_at"),
+        "signal_name": signal_name,
+    }
+
+
+def _record_system_event(observability, *, event_type: str, payload: dict[str, Any], symbol: Optional[str], action: str, reason: str) -> None:
+    observability.record_event(
+        category="system",
+        event_type=event_type,
+        source="src.cli.commands",
+        payload=payload,
+        symbol=symbol,
+        action=action,
+        reason=reason,
+    )
+
+
+def _request_runtime_action(
+    cfg,
+    *,
+    log_path: Path,
+    action: str,
+    reason: str,
+    timeout_seconds: int,
+    request_source: str,
+) -> tuple[Optional[int], Optional[dict[str, Any]], dict[str, Any]]:
+    paths = _runtime_control_paths(cfg, log_path)
+    active_pid = _read_pid_file(paths["pid_file"])
+    runtime_status = _read_runtime_status(cfg, log_path)
+    request = _build_lifecycle_request(action=action, reason=reason, source=request_source)
+    _write_lifecycle_request(cfg, request, log_path)
+    if active_pid is None or not _pid_is_running(active_pid):
+        if active_pid is not None:
+            _remove_file_if_exists(paths["pid_file"])
+        if runtime_status and runtime_status.get("running"):
+            _mark_runtime_inactive(
+                cfg,
+                log_path=log_path,
+                config_path=str(runtime_status.get("config_path") or _resolve_config_path(None)),
+                data_mode=str(runtime_status.get("data_mode") or "unknown"),
+                lifecycle_request=request,
+                run_id=runtime_status.get("run_id"),
+                status="stopped",
+            )
+        return None, runtime_status, request
+
+    os.kill(active_pid, signal.SIGTERM)
+    deadline = time.time() + max(timeout_seconds, 1)
+    while time.time() < deadline:
+        if not _pid_is_running(active_pid):
+            return active_pid, runtime_status, request
+        time.sleep(0.25)
+
+    raise click.ClickException(f"Timed out waiting for PID {active_pid} to {action}.")
+
+
+def _shutdown_runtime(
+    *,
+    cfg,
+    config_path: str,
+    log_path: Path,
+    observability,
+    server,
+    engine,
+    symbol: Optional[str],
+    shutdown_request: dict[str, Any],
+    started_engine: bool,
+    started_server: bool,
+    startup_completed: bool,
+) -> None:
+    shutdown_reason = str(shutdown_request.get("operator_reason") or "shutdown_requested")
+    requested_action = str(shutdown_request.get("requested_action") or "stop")
+    signal_name = shutdown_request.get("signal_name")
+    lifecycle_state = _set_lifecycle_state(
+        phase="stopping",
+        requested_action=requested_action,
+        operator_reason=shutdown_reason,
+        signal_name=signal_name,
+        request_id=shutdown_request.get("request_id"),
+        requested_at=shutdown_request.get("requested_at"),
+        request_source=shutdown_request.get("request_source"),
+        requester_pid=shutdown_request.get("requester_pid"),
+        last_shutdown_started_at=_utc_now().isoformat(),
+    )
+    set_state(status="stopping", running=False)
+    _mark_runtime_phase(
+        cfg,
+        log_path=log_path,
+        config_path=config_path,
+        data_mode="live",
+        phase="stopping",
+        running=False,
+        lifecycle_request=shutdown_request,
+        run_id=observability.get_run_id() if observability else None,
+        status="stopping",
+    )
+    if observability:
+        _record_system_event(
+            observability,
+            event_type="shutdown_requested",
+            payload={
+                "requested_action": requested_action,
+                "operator_reason": shutdown_reason,
+                "signal_name": signal_name,
+                "request_id": shutdown_request.get("request_id"),
+                "request_source": shutdown_request.get("request_source"),
+                "requester_pid": shutdown_request.get("requester_pid"),
+                "startup_completed": startup_completed,
+            },
+            symbol=symbol,
+            action="stop" if requested_action != "restart" else "restart",
+            reason=shutdown_reason,
+        )
+    shutdown_error: Optional[str] = None
+    if started_engine:
+        try:
+            engine.stop()
+        except Exception as exc:
+            shutdown_error = str(exc)
+            logger.exception("Engine shutdown failed")
+            if observability:
+                _record_system_event(
+                    observability,
+                    event_type="shutdown_engine_failed",
+                    payload={"error": shutdown_error},
+                    symbol=symbol,
+                    action="stop",
+                    reason="engine_shutdown_failed",
+                )
+    if started_server:
+        try:
+            server.stop()
+        except Exception as exc:
+            logger.exception("Debug server shutdown failed")
+            shutdown_error = shutdown_error or str(exc)
+            if observability:
+                _record_system_event(
+                    observability,
+                    event_type="shutdown_server_failed",
+                    payload={"error": str(exc)},
+                    symbol=symbol,
+                    action="stop",
+                    reason="server_shutdown_failed",
+                )
+    final_status = "error" if shutdown_error else "stopped"
+    final_reason = shutdown_error or shutdown_reason
+    if observability:
+        _record_system_event(
+            observability,
+            event_type="shutdown",
+            payload={
+                "requested_action": requested_action,
+                "operator_reason": shutdown_reason,
+                "signal_name": signal_name,
+                "request_id": shutdown_request.get("request_id"),
+                "request_source": shutdown_request.get("request_source"),
+                "requester_pid": shutdown_request.get("requester_pid"),
+                "startup_completed": startup_completed,
+                "shutdown_error": shutdown_error,
+            },
+            symbol=symbol,
+            action="stop" if requested_action != "restart" else "restart",
+            reason=final_reason,
+        )
+        observability.force_flush()
+    lifecycle_state = dict(lifecycle_state)
+    lifecycle_state.update(
+        {
+            "phase": "stopped" if final_status == "stopped" else "error",
+            "last_shutdown_completed_at": _utc_now().isoformat(),
+            "last_shutdown_reason": final_reason,
+            "last_requested_action": requested_action,
+        }
+    )
+    set_state(
+        running=False,
+        status=final_status,
+        lifecycle=lifecycle_state,
+    )
+    _mark_runtime_inactive(
+        cfg,
+        log_path=log_path,
+        config_path=config_path,
+        data_mode="live",
+        lifecycle_request=shutdown_request,
+        run_id=observability.get_run_id() if observability else None,
+        status=final_status,
+    )
+    if observability:
+        observability.stop()
+
+
 def _print_banner(title: str, color: str = "cyan") -> None:
     click.secho("=" * 50, fg=color)
     click.secho(title, fg=color, bold=True)
     click.secho("=" * 50, fg=color)
 
 
-def _log_startup_summary(cfg, log_path: Path, mock: bool, current_zone: Optional[str], zone_state: str) -> None:
-    mcp_url = f"http://{cfg.server.host}:{cfg.server.debug_port}{cfg.server.mcp_path}" if cfg.server.mcp_enabled else "disabled"
+def _log_startup_summary(cfg, log_path: Path, current_zone: Optional[str], zone_state: str) -> None:
+    mcp_url = getattr(cfg.server, "railway_mcp_url", None) or ""
+    mcp_url = mcp_url.strip() if mcp_url else "disabled"
     logger.info(
-        "startup_summary capital=%s max_contracts=%s hot_zones=%s matrix_version=%s preferred_account_match=%s trade_outside_hotzones=%s mock_mode=%s log_file=%s",
+        "startup_summary capital=%s max_contracts=%s hot_zones=%s matrix_version=%s preferred_account_match=%s trade_outside_hotzones=%s log_file=%s",
         cfg.account.capital,
         cfg.account.max_contracts,
         len(cfg.hot_zones),
         cfg.alpha.matrix_version,
         cfg.safety.preferred_account_match,
         cfg.strategy.trade_outside_hotzones,
-        mock,
         log_path,
     )
     logger.info(
@@ -158,8 +582,14 @@ def _log_startup_summary(cfg, log_path: Path, mock: bool, current_zone: Optional
     )
 
 
-def _startup_payload(cfg, log_path: Path, mock: bool, current_zone: Optional[str], zone_state: str) -> dict:
-    return {
+def _startup_payload(
+    cfg,
+    log_path: Path,
+    current_zone: Optional[str],
+    zone_state: str,
+    lifecycle_request: Optional[dict[str, Any]] = None,
+) -> dict:
+    payload = {
         "capital": cfg.account.capital,
         "max_contracts": cfg.account.max_contracts,
         "symbols": list(cfg.symbols),
@@ -167,7 +597,6 @@ def _startup_payload(cfg, log_path: Path, mock: bool, current_zone: Optional[str
         "matrix_version": cfg.alpha.matrix_version,
         "preferred_account_match": cfg.safety.preferred_account_match,
         "trade_outside_hotzones": cfg.strategy.trade_outside_hotzones,
-        "mock_mode": mock,
         "log_file": str(log_path),
         "health_port": cfg.server.health_port,
         "debug_port": cfg.server.debug_port,
@@ -175,6 +604,18 @@ def _startup_payload(cfg, log_path: Path, mock: bool, current_zone: Optional[str
         "current_zone": current_zone,
         "zone_state": zone_state,
     }
+    if lifecycle_request:
+        payload.update(
+            {
+                "lifecycle_request_id": lifecycle_request.get("request_id"),
+                "requested_action": lifecycle_request.get("action"),
+                "operator_reason": lifecycle_request.get("reason"),
+                "request_source": lifecycle_request.get("source"),
+                "requester_pid": lifecycle_request.get("requester_pid"),
+                "requested_at": lifecycle_request.get("requested_at"),
+            }
+        )
+    return payload
 
 
 def _resolve_config_path(config: Optional[str]) -> str:
@@ -184,11 +625,34 @@ def _resolve_config_path(config: Optional[str]) -> str:
 
 
 def _runtime_urls(cfg) -> dict:
+    mcp_url = getattr(cfg.server, "railway_mcp_url", None)
     return {
         "health_url": f"http://{cfg.server.host}:{cfg.server.health_port}/health",
         "debug_url": f"http://{cfg.server.host}:{cfg.server.debug_port}/debug",
-        "mcp_url": f"http://{cfg.server.host}:{cfg.server.debug_port}{cfg.server.mcp_path}" if cfg.server.mcp_enabled else None,
+        "mcp_url": mcp_url.strip() if mcp_url else None,
     }
+
+
+def _fetch_remote_debug_state(cfg, timeout_seconds: float = 1.5) -> Optional[dict[str, Any]]:
+    debug_url = f"http://{cfg.server.host}:{cfg.server.debug_port}/debug"
+    try:
+        response = requests.get(debug_url, timeout=timeout_seconds)
+        response.raise_for_status()
+        payload = response.json()
+        return payload if isinstance(payload, dict) else None
+    except Exception:
+        return None
+
+
+def _fetch_remote_health(cfg, timeout_seconds: float = 1.5) -> Optional[dict[str, Any]]:
+    health_url = f"http://{cfg.server.host}:{cfg.server.health_port}/health"
+    try:
+        response = requests.get(health_url, timeout=timeout_seconds)
+        response.raise_for_status()
+        payload = response.json()
+        return payload if isinstance(payload, dict) else None
+    except Exception:
+        return None
 
 
 def _record_runtime_provenance(cfg, observability, *, config_path: str, log_path: Path, data_mode: str):
@@ -239,10 +703,9 @@ def cli():
 
 
 @cli.command()
-@click.option('--mock', is_flag=True, help='Run in mock mode (no API)')
 @click.option('--config', type=click.Path(exists=True), help='Config file path')
-def start(mock: bool, config: Optional[str]):
-    """Start the trading engine."""
+def start(config: Optional[str]):
+    """Start the trading engine (live: real Topstep API, practice or funded account)."""
     _print_banner("ES Hot-Zone Trader Starting...")
     
     # Load config
@@ -253,6 +716,8 @@ def start(mock: bool, config: Optional[str]):
         cfg = get_config()
     set_config(cfg)
     log_path = _configure_logging(cfg)
+    _ensure_runtime_is_not_active(cfg, log_path=log_path)
+    startup_request = _read_lifecycle_request(cfg, log_path)
     observability = get_observability_store(force_recreate=True)
     observability.start()
     client = get_client(force_recreate=True)
@@ -260,6 +725,13 @@ def start(mock: bool, config: Optional[str]):
     scheduler = get_scheduler(force_recreate=True)
     get_risk_manager(force_recreate=True)
     engine = get_trading_engine(force_recreate=True)
+    symbol = cfg.symbols[0] if cfg.symbols else None
+    started_server = False
+    started_engine = False
+    startup_completed = False
+    shutdown_signal = {"name": None}
+    shutdown_requested = threading.Event()
+    previous_signal_handlers: dict[int, Any] = {}
     
     click.secho(f"Config loaded: ${cfg.account.capital} account, max {cfg.account.max_contracts} contracts", fg="green")
     click.secho(f"Hot zones: {len(cfg.hot_zones)} configured", fg="green")
@@ -267,29 +739,40 @@ def start(mock: bool, config: Optional[str]):
     click.secho(f"Preferred account match: {cfg.safety.preferred_account_match}", fg="green")
     click.secho(f"Trade outside hot zones: {cfg.strategy.trade_outside_hotzones}", fg="green")
     click.secho(f"Log file: {log_path}", fg="green")
-    
-    # Initialize mock mode if requested
-    if mock:
-        click.secho("Running in MOCK mode (no real trading)", fg="yellow", bold=True)
-        client.enable_mock_mode()
-        executor.enable_mock_mode()
+    click.secho("Live: Topstep API (real market data and orders).", fg="green")
+    _mark_runtime_active(cfg, log_path=log_path, config_path=config_path, data_mode="live", lifecycle_request=startup_request)
+    _set_lifecycle_state(
+        phase="starting",
+        requested_action=(startup_request or {}).get("action") or "start",
+        operator_reason=(startup_request or {}).get("reason") or "live_start",
+        request_id=(startup_request or {}).get("request_id"),
+        requested_at=(startup_request or {}).get("requested_at"),
+        request_source=(startup_request or {}).get("source"),
+        requester_pid=(startup_request or {}).get("requester_pid"),
+        last_start_requested_at=_utc_now().isoformat(),
+    )
     
     # Start debug servers
     server = get_server(force_recreate=True)
     server.start()
+    started_server = True
     click.secho(f"Health server: http://127.0.0.1:{cfg.server.health_port}/health", fg="blue")
     click.secho(f"Debug server:  http://127.0.0.1:{cfg.server.debug_port}/debug", fg="blue")
-    click.secho(f"MCP server:    http://127.0.0.1:{cfg.server.debug_port}{cfg.server.mcp_path}", fg="blue")
-    
+    railway_mcp = getattr(cfg.server, "railway_mcp_url", None)
+    if railway_mcp and railway_mcp.strip():
+        click.secho(f"MCP (Railway): {railway_mcp.strip()}", fg="blue")
+    if start_railway_bridge():
+        click.secho("Railway bridge: started (outbox → ingest)", fg="blue")
+
     # Update state
     set_state(
         running=True,
         status="running",
-        start_time=__import__('time').time(),
-        data_mode="mock" if mock else "live",
+        start_time=time.time(),
+        data_mode="live",
         replay_summary=None,
     )
-    _record_runtime_provenance(cfg, observability, config_path=config_path, log_path=log_path, data_mode="mock" if mock else "live")
+    _record_runtime_provenance(cfg, observability, config_path=config_path, log_path=log_path, data_mode="live")
     
     # Show current zone
     zone = scheduler.get_current_zone()
@@ -304,58 +787,117 @@ def start(mock: bool, config: Optional[str]):
         )
         current_zone_name = "Outside" if cfg.strategy.trade_outside_hotzones else None
         zone_state = "active" if cfg.strategy.trade_outside_hotzones else "inactive"
-    _log_startup_summary(cfg, log_path, mock, current_zone_name, zone_state)
-    observability.record_event(
-        category="system",
+    _log_startup_summary(cfg, log_path, current_zone_name, zone_state)
+    _record_system_event(
+        observability,
         event_type="startup",
-        source="src.cli.commands",
-        payload=_startup_payload(cfg, log_path, mock, current_zone_name, zone_state),
-        symbol=cfg.symbols[0] if cfg.symbols else None,
-        zone=current_zone_name,
+        payload=_startup_payload(cfg, log_path, current_zone_name, zone_state, startup_request),
+        symbol=symbol,
         action="start",
         reason="cli_start",
     )
+
+    def _request_shutdown(signum, _frame) -> None:
+        shutdown_signal["name"] = signal.Signals(signum).name
+        shutdown_requested.set()
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        previous_signal_handlers[sig] = signal.getsignal(sig)
+        signal.signal(sig, _request_shutdown)
     
     try:
-        engine.start(mock=mock)
+        engine.start()
+        started_engine = True
     except Exception as exc:
         logger.exception("Engine startup failed")
-        observability.record_event(
-            category="system",
+        _record_system_event(
+            observability,
             event_type="startup_failed",
-            source="src.cli.commands",
-            payload={"error": str(exc), "mock_mode": mock},
-            symbol=cfg.symbols[0] if cfg.symbols else None,
-            zone=current_zone_name,
+            payload={
+                "error": str(exc),
+                "request_id": (startup_request or {}).get("request_id"),
+                "requested_action": (startup_request or {}).get("action"),
+                "operator_reason": (startup_request or {}).get("reason"),
+            },
+            symbol=symbol,
             action="start",
             reason="engine_startup_failed",
         )
-        observability.stop()
+        observability.force_flush()
+        _set_lifecycle_state(
+            phase="error",
+            last_startup_failed_at=_utc_now().isoformat(),
+            last_startup_error=str(exc),
+        )
+        _mark_runtime_inactive(
+            cfg,
+            log_path=log_path,
+            config_path=config_path,
+            data_mode="live",
+            lifecycle_request=startup_request,
+            run_id=observability.get_run_id(),
+            status="error",
+        )
         set_state(running=False, status="error")
-        server.stop()
+        _clear_lifecycle_request(cfg, log_path)
+        if started_server:
+            server.stop()
+        observability.stop()
         raise click.ClickException(str(exc))
+    startup_completed = True
+    _set_lifecycle_state(
+        phase="running",
+        last_startup_completed_at=_utc_now().isoformat(),
+        last_startup_error=None,
+        active_run_id=observability.get_run_id(),
+    )
+    _mark_runtime_phase(
+        cfg,
+        log_path=log_path,
+        config_path=config_path,
+        data_mode="live",
+        phase="running",
+        running=True,
+        lifecycle_request=startup_request,
+        run_id=observability.get_run_id(),
+        status="running",
+    )
+    _clear_lifecycle_request(cfg, log_path)
     click.secho("\nTrading engine is running...", fg="green", bold=True)
     click.secho("Press Ctrl+C to stop", fg="yellow")
     
     try:
-        import time
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        click.secho("\nShutting down...", fg="yellow", bold=True)
-        engine.stop()
-        observability.record_event(
-            category="system",
-            event_type="shutdown",
-            source="src.cli.commands",
-            payload={"mock_mode": mock},
-            symbol=cfg.symbols[0] if cfg.symbols else None,
-            action="stop",
-            reason="keyboard_interrupt",
-        )
-        observability.stop()
-        set_state(running=False, status="stopped")
-        server.stop()
+        while not shutdown_requested.wait(timeout=1.0):
+            pass
+    finally:
+        for sig, previous in previous_signal_handlers.items():
+            signal.signal(sig, previous)
+
+    click.secho("\nShutting down...", fg="yellow", bold=True)
+    shutdown_request = _resolve_shutdown_request(
+        cfg,
+        log_path=log_path,
+        fallback_reason="signal_shutdown" if shutdown_signal["name"] else "shutdown_requested",
+        signal_name=shutdown_signal["name"],
+    )
+    _shutdown_runtime(
+        cfg=cfg,
+        config_path=config_path,
+        log_path=log_path,
+        observability=observability,
+        server=server,
+        engine=engine,
+        symbol=symbol,
+        shutdown_request=shutdown_request,
+        started_engine=started_engine,
+        started_server=started_server,
+        startup_completed=startup_completed,
+    )
+    if shutdown_request.get("requested_action") != "restart":
+        _clear_lifecycle_request(cfg, log_path)
+    if shutdown_request.get("requested_action") == "restart":
+        click.secho("Stopped and ready for restart.", fg="green")
+    else:
         click.secho("Done.", fg="green")
 
 
@@ -371,9 +913,17 @@ def replay(path: str, config: Optional[str]):
         cfg = get_config()
     set_config(cfg)
     log_path = _configure_logging(cfg)
+    _ensure_runtime_is_not_active(cfg, log_path=log_path)
     observability = get_observability_store(force_recreate=True)
     observability.start()
-    set_state(status="replay", running=False, data_mode="replay", replay_summary=None, start_time=__import__('time').time())
+    _mark_runtime_active(cfg, log_path=log_path, config_path=config_path, data_mode="replay")
+    _set_lifecycle_state(
+        phase="replay",
+        requested_action="replay",
+        operator_reason="cli_replay",
+        last_start_requested_at=_utc_now().isoformat(),
+    )
+    set_state(status="replay", running=False, data_mode="replay", replay_summary=None, start_time=time.time())
     get_client(force_recreate=True)
     get_executor(force_recreate=True)
     get_scheduler(force_recreate=True)
@@ -381,77 +931,173 @@ def replay(path: str, config: Optional[str]):
     engine = get_trading_engine(force_recreate=True)
     _record_runtime_provenance(cfg, observability, config_path=config_path, log_path=log_path, data_mode="replay")
 
-    runner = ReplayRunner(config=cfg, engine=engine)
-    result = runner.run(path)
-    observability.record_event(
-        category="system",
-        event_type="replay_completed",
-        source="src.cli.commands",
-        payload={"path": str(path), "events": result.events, "segments": result.segments},
-        symbol=cfg.symbols[0] if cfg.symbols else None,
-        action="replay",
-        reason="cli_replay",
-    )
-    observability.stop()
-    click.echo(
-        json.dumps(
-            {
-                "path": result.path,
-                "events": result.events,
-                "segments": result.segments,
-                "summary": result.summary,
-            },
-            indent=2,
-            default=str,
+    try:
+        runner = ReplayRunner(config=cfg, engine=engine)
+        result = runner.run(path)
+        run_id = observability.get_run_id()
+        if getattr(cfg.observability, "backfill_missing_trade_records", True):
+            backfill_result = observability.backfill_completed_trades_from_events(run_id=run_id)
+            observability.record_event(
+                category="system",
+                event_type="trade_backfill_checked",
+                source=__name__,
+                payload=backfill_result,
+                symbol=cfg.symbols[0] if cfg.symbols else None,
+                action="backfill_completed_trades",
+                reason="replay_backfill_check",
+            )
+        observability.update_run_manifest_payload(
+            run_id,
+            {"replay_path": path, "replay_events": result.events, "replay_summary": result.summary},
         )
-    )
+        _record_system_event(
+            observability,
+            event_type="replay_completed",
+            payload={"path": str(path), "events": result.events, "segments": result.segments},
+            symbol=cfg.symbols[0] if cfg.symbols else None,
+            action="replay",
+            reason="cli_replay",
+        )
+        _set_lifecycle_state(
+            phase="stopped",
+            last_startup_completed_at=_utc_now().isoformat(),
+            last_shutdown_completed_at=_utc_now().isoformat(),
+            last_shutdown_reason="replay_completed",
+            last_requested_action="replay",
+        )
+        _mark_runtime_inactive(
+            cfg,
+            log_path=log_path,
+            config_path=config_path,
+            data_mode="replay",
+            run_id=observability.get_run_id(),
+            status="stopped",
+        )
+        observability.stop()
+        click.echo(
+            json.dumps(
+                {
+                    "path": result.path,
+                    "events": result.events,
+                    "segments": result.segments,
+                    "summary": result.summary,
+                },
+                indent=2,
+                default=str,
+            )
+        )
+    except Exception:
+        _mark_runtime_inactive(
+            cfg,
+            log_path=log_path,
+            config_path=config_path,
+            data_mode="replay",
+            run_id=observability.get_run_id(),
+            status="error",
+        )
+        observability.stop()
+        raise
 
 
 @cli.command()
-def stop():
+@click.option('--reason', default='cli_stop', show_default=True, type=str, help='Reason recorded for the shutdown request')
+@click.option('--timeout-seconds', default=20, show_default=True, type=int, help='Seconds to wait for the process to exit cleanly')
+def stop(reason: str, timeout_seconds: int):
     """Stop the trading engine."""
-    get_trading_engine().stop()
-    observability = get_observability_store()
-    observability.record_event(
-        category="system",
-        event_type="shutdown",
-        source="src.cli.commands",
-        payload={"invoked_by": "cli_stop"},
+    cfg = get_config()
+    log_path = _resolve_log_path(cfg)
+    active_pid, _, _ = _request_runtime_action(
+        cfg,
+        log_path=log_path,
         action="stop",
-        reason="cli_stop",
+        reason=reason,
+        timeout_seconds=timeout_seconds,
+        request_source="src.cli.commands.stop",
     )
-    observability.stop()
-    server = get_server()
-    server.stop()
-    set_state(running=False, status="stopped")
-    click.echo("Trading engine stopped.")
+    if active_pid is None:
+        _clear_lifecycle_request(cfg, log_path)
+        click.echo("Trading engine is not running.")
+        return
+    click.echo(f"Trading engine stopped (PID {active_pid}, reason={reason}).")
+
+
+@cli.command()
+@click.option('--config', type=click.Path(exists=True), help='Config file path for the restarted process')
+@click.option('--reason', default='cli_restart', show_default=True, type=str, help='Reason recorded for the restart request')
+@click.option('--timeout-seconds', default=20, show_default=True, type=int, help='Seconds to wait for the prior process to exit cleanly')
+@click.pass_context
+def restart(ctx: click.Context, config: Optional[str], reason: str, timeout_seconds: int):
+    """Restart the trading engine (always live)."""
+    cfg = load_config(config) if config else get_config()
+    set_config(cfg)
+    log_path = _resolve_log_path(cfg)
+    active_pid, runtime_status, _ = _request_runtime_action(
+        cfg,
+        log_path=log_path,
+        action="restart",
+        reason=reason,
+        timeout_seconds=timeout_seconds,
+        request_source="src.cli.commands.restart",
+    )
+    restart_config_path = config or ((runtime_status or {}).get("config_path") if runtime_status else None)
+    if active_pid is None:
+        click.echo("Trading engine is not running. Starting a fresh process with restart intent.")
+    else:
+        click.echo(f"Trading engine stopped for restart (PID {active_pid}, reason={reason}).")
+    ctx.invoke(start, config=restart_config_path)
 
 
 @cli.command()
 def status():
     """Show current trading status."""
-    state = get_state()
-    
+    cfg = get_config()
+    remote = _fetch_remote_debug_state(cfg)
+    if remote:
+        status_value = str(remote.get("status", "unknown"))
+        running_value = bool(remote.get("running", False))
+        data_mode = str(remote.get("data_mode", "unknown"))
+        zone_name = str((remote.get("zone") or {}).get("name") or "None")
+        zone_state = str((remote.get("zone") or {}).get("state") or "inactive")
+        strategy = str(remote.get("strategy", "None"))
+        position_contracts = int((remote.get("position") or {}).get("contracts") or 0)
+        position_pnl = float((remote.get("position") or {}).get("unrealized_pnl") or 0.0)
+        daily_pnl = float((remote.get("account") or {}).get("daily_pnl") or 0.0)
+        risk_state = str((remote.get("risk") or {}).get("state") or "normal")
+    else:
+        state = get_state()
+        status_value = str(state.effective_status())
+        running_value = bool(state.running)
+        data_mode = str(state.data_mode)
+        zone_name = str(state.current_zone or "None")
+        zone_state = str(state.zone_state)
+        strategy = str(state.current_strategy or "None")
+        position_contracts = int(state.position)
+        position_pnl = float(state.position_pnl)
+        daily_pnl = float(state.daily_pnl)
+        risk_state = str(state.risk_state)
+
     _print_banner("Trading Status", color="blue")
-    effective_status = state.effective_status()
-    click.secho(f"Status:    {effective_status}", fg="green" if effective_status == "healthy" else "yellow")
-    click.secho(f"Running:   {state.running}", fg="green" if state.running else "yellow")
-    click.secho(f"Data Mode: {state.data_mode}", fg="blue")
-    click.secho(f"Zone:      {state.current_zone or 'None'} ({state.zone_state})", fg="cyan")
-    click.secho(f"Strategy:  {state.current_strategy or 'None'}", fg="cyan")
-    click.secho(f"Position:  {state.position} contracts", fg="magenta")
-    click.secho(f"Position PnL: ${state.position_pnl:.2f}", fg="magenta")
-    click.secho(f"Daily PnL: ${state.daily_pnl:.2f}", fg="magenta")
-    click.secho(f"Risk State: {state.risk_state}", fg="red" if str(state.risk_state).lower() != "normal" else "green")
+    click.secho(f"Status:    {status_value}", fg="green" if status_value in {"healthy", "running"} else "yellow")
+    click.secho(f"Running:   {running_value}", fg="green" if running_value else "yellow")
+    click.secho(f"Data Mode: {data_mode}", fg="blue")
+    click.secho(f"Zone:      {zone_name} ({zone_state})", fg="cyan")
+    click.secho(f"Strategy:  {strategy}", fg="cyan")
+    click.secho(f"Position:  {position_contracts} contracts", fg="magenta")
+    click.secho(f"Position PnL: ${position_pnl:.2f}", fg="magenta")
+    click.secho(f"Daily PnL: ${daily_pnl:.2f}", fg="magenta")
+    click.secho(f"Risk State: {risk_state}", fg="red" if risk_state.lower() != "normal" else "green")
     click.secho("=" * 50, fg="blue")
+    if not remote:
+        click.secho("Note: runtime endpoints unavailable; showing local process state only.", fg="yellow")
 
 
 @cli.command()
 def health():
     """Show health check results."""
-    state = get_state()
-    health = state.to_health_dict()
-    
+    cfg = get_config()
+    remote_health = _fetch_remote_health(cfg)
+    health = remote_health or get_state().to_health_dict()
+
     click.echo("Health Check:")
     click.echo(f"  Status:      {health['status']}")
     click.echo(f"  Data Mode:   {health['data_mode']}")
@@ -459,14 +1105,15 @@ def health():
     click.echo(f"  Position:    {health['position']}")
     click.echo(f"  Daily PnL:   ${health['daily_pnl']:.2f}")
     click.echo(f"  Risk State:  {health['risk_state']}")
+    if not remote_health:
+        click.echo("  Note: runtime health endpoint unavailable; showing local process state.")
 
 
 @cli.command()
 def debug():
     """Show full debug information."""
-    state = get_state()
-    data = state.to_dict()
-    
+    cfg = get_config()
+    data = _fetch_remote_debug_state(cfg) or get_state().to_dict()
     click.echo(json.dumps(data, indent=2))
 
 
@@ -546,9 +1193,13 @@ def balance():
         click.echo("Unable to fetch account. Make sure you're authenticated.")
 
 
-def main():
+def main(argv: Optional[list[str]] = None):
     """Main entry point."""
-    cli()
+    args = list(argv if argv is not None else sys.argv[1:])
+    if not args:
+        cli(["--help"], prog_name="es-trade")
+        return
+    cli(args=args, prog_name="es-trade")
 
 
 if __name__ == '__main__':

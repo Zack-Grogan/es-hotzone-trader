@@ -60,6 +60,10 @@ class StrategyConfig:
     mr_time_stop_minutes: int = 20
     mr_exit_at_vwap: bool = True
     trade_outside_hotzones: bool = False
+    breakeven_trigger_atr: float = 0.5
+    profit_lock_atr: float = 0.5
+    trailing_stop_atr: float = 1.0
+    dynamic_exit_update_cadence_seconds: float = 10.0
 
 
 @dataclass
@@ -266,6 +270,8 @@ class OrderExecutionConfig:
     market_order_fallback: bool = True
     max_slippage_ticks: int = 3
     cancel_timeout_seconds: int = 60
+    retry_attempts: int = 3
+    retry_delay_seconds: float = 1.0
 
 
 @dataclass
@@ -389,6 +395,7 @@ class ServerConfig:
     host: str = "127.0.0.1"
     mcp_enabled: bool = True
     mcp_path: str = "/mcp"
+    railway_mcp_url: Optional[str] = None
 
 
 @dataclass
@@ -411,6 +418,12 @@ class ObservabilityConfig:
     capture_run_provenance: bool = True
     persist_completed_trades: bool = True
     backfill_missing_trade_records: bool = True
+    railway_ingest_url: str = ""
+    railway_ingest_api_key: str = ""
+    bridge_interval_seconds: float = 30.0
+    outbox_path: str = "logs/railway_outbox.db"
+    bridge_retry_attempts: int = 5
+    bridge_retry_base_seconds: float = 2.0
 
 
 @dataclass

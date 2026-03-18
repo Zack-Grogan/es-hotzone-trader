@@ -1,0 +1,56 @@
+"""Tests for Railway data bridge and outbox."""
+from __future__ import annotations
+
+import json
+import os
+import tempfile
+import unittest
+
+from src.bridge.outbox import RailwayOutbox
+from src.bridge.railway_bridge import start_railway_bridge, stop_railway_bridge
+
+
+class TestRailwayOutbox(unittest.TestCase):
+    def setUp(self) -> None:
+        self._dir = tempfile.mkdtemp()
+        self.outbox_path = os.path.join(self._dir, "outbox.db")
+
+    def tearDown(self) -> None:
+        try:
+            import shutil
+            shutil.rmtree(self._dir, ignore_errors=True)
+        except Exception:
+            pass
+
+    def test_enqueue_dequeue_mark_sent(self) -> None:
+        outbox = RailwayOutbox(self.outbox_path)
+        ok = outbox.enqueue("state", {"run_id": "r1", "x": 1}, batch_id="b1")
+        self.assertTrue(ok)
+        outbox.enqueue("state", {"run_id": "r1", "x": 2}, batch_id="b1")  # duplicate batch_id may be ignored
+        batches = outbox.dequeue_batch(limit=10)
+        self.assertEqual(len(batches), 1)
+        self.assertEqual(batches[0]["kind"], "state")
+        self.assertEqual(json.loads(batches[0]["payload_json"])["run_id"], "r1")
+        outbox.mark_sent(batches[0]["id"])
+        batches2 = outbox.dequeue_batch(limit=10)
+        self.assertEqual(len(batches2), 0)
+        outbox.close()
+
+    def test_mark_failed_increments_attempts(self) -> None:
+        outbox = RailwayOutbox(self.outbox_path)
+        outbox.enqueue("events", {"events": []}, batch_id="e1")
+        batches = outbox.dequeue_batch(limit=10)
+        self.assertEqual(len(batches), 1)
+        outbox.mark_failed(batches[0]["id"], "HTTP 500")
+        batches2 = outbox.dequeue_batch(limit=10)
+        self.assertEqual(len(batches2), 1)
+        self.assertEqual(batches2[0]["attempts"], 1)
+        outbox.close()
+
+
+class TestRailwayBridgeStart(unittest.TestCase):
+    def test_start_returns_false_when_no_url(self) -> None:
+        stop_railway_bridge()
+        # Rely on default config having empty railway_ingest_url
+        started = start_railway_bridge()
+        self.assertFalse(started)

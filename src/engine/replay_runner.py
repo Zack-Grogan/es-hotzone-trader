@@ -47,6 +47,7 @@ class ReplayRunner:
         synthetic_quotes_detected = any(event.quote_is_synthetic for event in events)
 
         self.engine.reset_runtime_state(clear_history=True)
+        # Replay runs with offline execution (no broker orders); state and data_mode are labeled "replay".
         self.engine.enable_mock_mode()
 
         processed = 0

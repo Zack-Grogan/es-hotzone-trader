@@ -61,6 +61,11 @@ strategy:
   mr_band_deviation: 2.0
   mr_time_stop_minutes: 20
   mr_exit_at_vwap: true
+  trade_outside_hotzones: true
+  breakeven_trigger_atr: 0.5
+  profit_lock_atr: 0.5
+  trailing_stop_atr: 1.0
+  dynamic_exit_update_cadence_seconds: 10.0
 
 alpha:
   matrix_version: "hotzone-v3"
@@ -203,6 +208,8 @@ order_execution:
   market_order_fallback: true
   max_slippage_ticks: 3
   cancel_timeout_seconds: 60
+  retry_attempts: 3
+  retry_delay_seconds: 1.0
 
 blackout_events:
   pre_minutes: 5
@@ -311,6 +318,7 @@ server:
   host: "127.0.0.1"
   mcp_enabled: true
   mcp_path: "/mcp"
+  railway_mcp_url: ""
 
 logging:
   level: "INFO"
@@ -329,6 +337,9 @@ observability:
   capture_run_provenance: true
   persist_completed_trades: true
   backfill_missing_trade_records: true
-
-replay:
-  mode: "projectx_feed_replay"
+  railway_ingest_url: ""
+  railway_ingest_api_key: ""
+  bridge_interval_seconds: 30.0
+  outbox_path: "logs/railway_outbox.db"
+  bridge_retry_attempts: 5
+  bridge_retry_base_seconds: 2.0

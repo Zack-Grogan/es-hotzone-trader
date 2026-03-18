@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 import math
 import random
+import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import Enum
@@ -12,6 +13,11 @@ from typing import Any, Dict, List, Optional
 from src.config import OrderExecutionConfig, ReplayExecutionConfig, WatchdogConfig, get_config
 from src.market.topstep_client import MarketData, TopstepClient, get_client
 from src.observability import get_observability_store
+
+try:
+    import requests
+except ImportError:
+    requests = None  # type: ignore
 
 logger = logging.getLogger(__name__)
 
@@ -76,7 +82,7 @@ class Order:
 
 
 class OrderExecutor:
-    """Order execution manager for live and replay/mock flows."""
+    """Order execution manager for live and replay flows."""
 
     def __init__(self, config=None):
         self.config = config or get_config()
@@ -111,24 +117,28 @@ class OrderExecutor:
         reason: Optional[str] = None,
         order_id: Optional[str] = None,
     ) -> None:
-        self.observability.record_event(
-            category="execution",
-            event_type=event_type,
-            source=__name__,
-            payload=payload or {},
-            event_time=event_time,
-            symbol=symbol,
-            action=action,
-            reason=reason,
-            order_id=order_id,
-            risk_state=None,
-        )
+        """Record execution event. Fail-open: never raise so trading is never blocked by observability."""
+        try:
+            self.observability.record_event(
+                category="execution",
+                event_type=event_type,
+                source=__name__,
+                payload=payload or {},
+                event_time=event_time,
+                symbol=symbol,
+                action=action,
+                reason=reason,
+                order_id=order_id,
+                risk_state=None,
+            )
+        except Exception:
+            logger.exception("Observability record_event failed (fail-open); event_type=%s", event_type)
 
     def enable_mock_mode(self) -> None:
-        """Enable mock mode for testing and replay."""
+        """Enable offline execution (no real orders sent to broker). For replay and tests only; practice-account runs use the live path."""
         self._mock_mode = True
         self.client.enable_mock_mode()
-        logger.info("Executor mock mode enabled")
+        logger.info("Executor offline execution enabled (replay/tests only)")
         self._record_event(
             event_type="mock_mode_enabled",
             payload={},
@@ -202,14 +212,27 @@ class OrderExecutor:
             return self._place_mock_order(symbol, quantity, side, order_type, limit_price, stop_price, is_protective, role)
 
         self._lifecycle_state = ExecutionState.ACK_PENDING
-        order_id = self.client.place_order(
-            symbol=symbol,
-            quantity=quantity,
-            side=side,
-            order_type=order_type,
-            limit_price=limit_price,
-            stop_price=stop_price,
-        )
+        attempts = max(1, getattr(self.exec_config, "retry_attempts", 3))
+        delay = max(0.0, getattr(self.exec_config, "retry_delay_seconds", 1.0))
+        order_id = None
+        for attempt in range(attempts):
+            try:
+                order_id = self.client.place_order(
+                    symbol=symbol,
+                    quantity=quantity,
+                    side=side,
+                    order_type=order_type,
+                    limit_price=limit_price,
+                    stop_price=stop_price,
+                )
+                break
+            except Exception as e:
+                last_exc = e
+                if requests and isinstance(e, requests.RequestException) and attempt < attempts - 1:
+                    logger.warning("place_order attempt %s/%s failed: %s; retrying in %.1fs", attempt + 1, attempts, e, delay)
+                    time.sleep(delay)
+                else:
+                    raise
         if order_id:
             order = Order(
                 order_id=order_id,
@@ -465,7 +488,21 @@ class OrderExecutor:
             )
             return True
 
-        if not self.client.cancel_order(order_id):
+        attempts = max(1, getattr(self.exec_config, "retry_attempts", 3))
+        delay = max(0.0, getattr(self.exec_config, "retry_delay_seconds", 1.0))
+        cancelled = False
+        for attempt in range(attempts):
+            try:
+                cancelled = self.client.cancel_order(order_id)
+                if cancelled:
+                    break
+            except Exception as e:
+                if requests and isinstance(e, requests.RequestException) and attempt < attempts - 1:
+                    logger.warning("cancel_order attempt %s/%s failed: %s; retrying in %.1fs", attempt + 1, attempts, e, delay)
+                    time.sleep(delay)
+                else:
+                    raise
+        if not cancelled:
             self._record_event(
                 event_type="order_cancel_failed",
                 payload={"mock_mode": False},
@@ -567,6 +604,21 @@ class OrderExecutor:
             )
             if self.cancel_order(order_id):
                 cancelled += 1
+                self._record_event(
+                    event_type="stale_order_cancelled",
+                    payload={
+                        "order_type": order.order_type,
+                        "age_seconds": age,
+                        "role": order.role,
+                        "is_protective": order.is_protective,
+                        "symbol": order.symbol,
+                    },
+                    event_time=now,
+                    symbol=order.symbol,
+                    action="cancel_stale_order",
+                    reason="stale_order_cancelled",
+                    order_id=order_id,
+                )
             else:
                 logger.warning("Unable to cancel stale order %s; it will remain locally active until broker state updates", order_id)
         return cancelled
