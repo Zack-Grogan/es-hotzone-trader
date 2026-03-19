@@ -8,7 +8,7 @@ import unittest
 
 from src.config import get_config, load_config, set_config
 from src.bridge.outbox import RailwayOutbox
-from src.bridge.railway_bridge import start_railway_bridge, stop_railway_bridge
+from src.bridge.railway_bridge import _record_delivery_success, start_railway_bridge, stop_railway_bridge
 
 
 class TestRailwayOutbox(unittest.TestCase):
@@ -63,3 +63,32 @@ class TestRailwayBridgeStart(unittest.TestCase):
         finally:
             stop_railway_bridge()
             set_config(previous)
+
+
+class TestRailwayBridgeDeliveryState(unittest.TestCase):
+    def test_run_manifest_success_clears_stale_error(self) -> None:
+        class _FakeOutbox:
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, int, str | None, str | None, str | None]] = []
+
+            def update_delivery_cursor(
+                self,
+                kind: str,
+                cursor_value: int,
+                *,
+                last_batch_id: str | None = None,
+                last_success_at: str | None = None,
+                last_error: str | None = None,
+            ) -> None:
+                self.calls.append((kind, cursor_value, last_batch_id, last_success_at, last_error))
+
+        outbox = _FakeOutbox()
+        _record_delivery_success(outbox, "run_manifest", {"run_manifest": {"run_id": "r1"}}, row_batch_id="batch-1")
+
+        self.assertEqual(len(outbox.calls), 1)
+        kind, cursor_value, last_batch_id, last_success_at, last_error = outbox.calls[0]
+        self.assertEqual(kind, "run_manifest")
+        self.assertEqual(cursor_value, 0)
+        self.assertEqual(last_batch_id, "batch-1")
+        self.assertIsNotNone(last_success_at)
+        self.assertIsNone(last_error)

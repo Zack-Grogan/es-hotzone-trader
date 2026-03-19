@@ -179,6 +179,24 @@ def _payload_max_local_id(kind: str, payload: dict[str, Any]) -> int:
         return 0
 
 
+def _record_delivery_success(
+    outbox: RailwayOutbox,
+    kind: str,
+    payload: dict[str, Any],
+    *,
+    row_batch_id: str,
+) -> None:
+    max_local_id = int(((payload.get("_cursor") or {}).get("max_local_id")) or _payload_max_local_id(kind, payload))
+    if max_local_id > 0 or kind == "run_manifest":
+        outbox.update_delivery_cursor(
+            kind,
+            max_local_id,
+            last_batch_id=row_batch_id,
+            last_success_at=datetime.now(UTC).isoformat(),
+            last_error=None,
+        )
+
+
 def _is_permanent_http_error(status_code: int) -> bool:
     return status_code in {400, 401, 403, 404, 409, 422}
 
@@ -422,15 +440,12 @@ def _run_bridge_loop(outbox: RailwayOutbox, ingest_url: str, api_key: str, inter
                         r = requests.post(url, json=payload, headers=headers, timeout=15)
                         if 200 <= r.status_code < 300:
                             outbox.mark_sent(row_id)
-                            max_local_id = int(((payload.get("_cursor") or {}).get("max_local_id")) or _payload_max_local_id(kind, payload))
-                            if max_local_id > 0:
-                                outbox.update_delivery_cursor(
-                                    kind,
-                                    max_local_id,
-                                    last_batch_id=row.get("batch_id"),
-                                    last_success_at=datetime.now(UTC).isoformat(),
-                                    last_error=None,
-                                )
+                            _record_delivery_success(
+                                outbox,
+                                kind,
+                                payload,
+                                row_batch_id=row.get("batch_id"),
+                            )
                             sent = True
                             break
                         err = f"HTTP {r.status_code}"
