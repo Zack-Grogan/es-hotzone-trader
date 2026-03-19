@@ -26,7 +26,7 @@ from src.engine import DecisionMatrixEvaluator, FeatureSnapshot, HotZoneSchedule
 from src.engine.event_provider import EventContext, LocalEventProvider
 from src.engine.market_context import OrderFlowSnapshot
 from src.engine.risk_manager import RiskManager, RiskState, TradeRecord
-from src.execution.executor import OrderExecutor, get_executor
+from src.execution.executor import OrderExecutor, OrderStatus, get_executor
 from src.indicators.rsi import rsi
 from src.market import Account, MarketData, Position, TopstepClient, get_client
 from src.observability import get_observability_store
@@ -960,6 +960,44 @@ class EngineRiskExecutionTests(unittest.TestCase):
         self.assertEqual(self.engine.executor.get_position(), 0)
         self.assertEqual(self.engine._last_exit_reason, "take_profit")
 
+    def test_sync_position_state_uses_cached_broker_position_after_lookup_error(self) -> None:
+        self.engine._mock_mode = False
+        cached_position = Position(symbol="ES", quantity=1, entry_price=100.25)
+        self.engine.client._positions = {"ES": cached_position}
+        self.engine._last_position = 1
+        self.engine._position_sync_requested = True
+
+        with patch.object(self.engine.client, "get_positions_snapshot", return_value=(None, "boom")):
+            self.engine._sync_position_state()
+
+        self.assertEqual(self.engine._last_position, 1)
+        self.assertFalse(self.engine._position_sync_requested)
+        self.assertEqual(self.engine._last_reconciliation_reason, "position_lookup_unavailable")
+
+    def test_sync_position_state_does_not_flatten_on_lookup_error_without_cache(self) -> None:
+        self.engine._mock_mode = False
+        self.engine.client._positions = {}
+        self.engine._last_position = 1
+        self.engine._position_sync_requested = True
+
+        with patch.object(self.engine.client, "get_positions_snapshot", return_value=(None, "boom")):
+            self.engine._sync_position_state()
+
+        self.assertEqual(self.engine._last_position, 1)
+        self.assertFalse(self.engine._position_sync_requested)
+        self.assertEqual(self.engine._last_reconciliation_reason, "position_lookup_unavailable")
+
+    def test_sync_position_state_clears_sync_flag_when_position_is_unchanged(self) -> None:
+        self.engine._mock_mode = False
+        self.engine._last_position = 1
+        self.engine._position_sync_requested = True
+
+        with patch.object(self.engine.client, "get_position", return_value=Position(symbol="ES", quantity=1, entry_price=100.0)):
+            self.engine._sync_position_state()
+
+        self.assertFalse(self.engine._position_sync_requested)
+        self.assertEqual(self.engine._last_reconciliation_reason, "position_sync")
+
     def test_watchdog_locks_out_after_stale_feed(self) -> None:
         self.engine._watchdog_state.last_feed_time = pd.Timestamp("2026-03-13T15:00:00Z").to_pydatetime()
         self.engine._latest_market_data = MarketData(
@@ -1543,6 +1581,77 @@ class ObservabilityStoreTests(unittest.TestCase):
             self.assertEqual(trades[0]["zone"], "Post-Open")
             store.stop()
 
+    def test_observability_store_persists_account_context_and_account_trade_history(self) -> None:
+        config = build_config()
+        config.observability.enabled = True
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config.observability.sqlite_path = str(Path(temp_dir) / "observability.db")
+            set_config(config)
+            store = get_observability_store(force_recreate=True, config=config)
+            store.start()
+            store.record_run_manifest(
+                {
+                    "run_id": store.get_run_id(),
+                    "started_at": "2026-03-16T12:00:00+00:00",
+                    "process_id": 42,
+                    "data_mode": "live",
+                    "symbols": ["ES"],
+                    "account": {"id": "ACC-1", "name": "Practice 50K", "is_practice": True},
+                }
+            )
+            store.record_completed_trade(
+                {
+                    "entry_time": "2026-03-16T12:01:00+00:00",
+                    "exit_time": "2026-03-16T12:02:00+00:00",
+                    "direction": 1,
+                    "contracts": 1,
+                    "entry_price": 100.0,
+                    "exit_price": 101.0,
+                    "pnl": 50.0,
+                    "zone": "Post-Open",
+                    "strategy": "WEIGHTED_SCORE_MATRIX",
+                    "regime": "TREND",
+                    "trade_id": "trade-1",
+                    "position_id": "position-1",
+                    "decision_id": "decision-1",
+                    "attempt_id": "attempt-1",
+                    "account_id": "ACC-1",
+                    "account_name": "Practice 50K",
+                    "account_is_practice": True,
+                }
+            )
+            store.record_account_trade(
+                {
+                    "id": 8604,
+                    "accountId": 203,
+                    "contractId": "CON.F.US.EP.H25",
+                    "creationTimestamp": "2025-01-21T16:13:52.523293+00:00",
+                    "price": 6065.25,
+                    "profitAndLoss": 50.0,
+                    "fees": 1.4,
+                    "side": 1,
+                    "size": 1,
+                    "voided": False,
+                    "orderId": 14328,
+                    "account_name": "Practice 50K",
+                    "account_is_practice": True,
+                },
+                run_id=store.get_run_id(),
+            )
+
+            manifest = store.get_run_manifest(store.get_run_id())
+            trades = store.query_completed_trades(limit=5)
+            account_trades = store.query_account_trades(limit=5)
+
+            self.assertEqual(manifest["account_id"], "ACC-1")
+            self.assertTrue(manifest["account_is_practice"])
+            self.assertEqual(trades[0]["account_id"], "ACC-1")
+            self.assertEqual(trades[0]["trade_id"], "trade-1")
+            self.assertTrue(trades[0]["account_is_practice"])
+            self.assertEqual(account_trades[0]["broker_trade_id"], "8604")
+            self.assertEqual(account_trades[0]["account_id"], "203")
+            store.stop()
+
     def test_engine_no_trade_persists_decision_event(self) -> None:
         config = build_config()
         config.observability.enabled = True
@@ -1949,6 +2058,19 @@ class ExecutorProtectionTests(unittest.TestCase):
 
         self.assertEqual(cancelled, 2)
         self.assertFalse(self.executor.is_protected("ES"))
+
+    def test_cancelled_last_protective_order_clears_tracking_without_forcing_flat(self) -> None:
+        placed = self.executor.ensure_protection("ES", 1, 1, 5800.0, None)
+
+        self.assertEqual(placed, 1)
+        protective_orders = self.executor.get_active_orders(symbol="ES", is_protective=True)
+        self.assertEqual(len(protective_orders), 1)
+
+        order = next(iter(protective_orders.values()))
+        self.executor.update_order_status(order.order_id, OrderStatus.CANCELLED)
+
+        self.assertFalse(self.executor.is_protected("ES"))
+        self.assertEqual(self.executor.get_lifecycle_state(), "WORKING")
 
     def test_protection_pending_too_long_only_when_requested_without_orders(self) -> None:
         now = datetime.fromisoformat("2026-03-13T15:00:10+00:00")

@@ -35,6 +35,13 @@ class TradeRecord:
     strategy: str
     regime: str = ""
     event_tags: list[str] | None = None
+    trade_id: str = ""
+    position_id: str = ""
+    decision_id: str = ""
+    attempt_id: str = ""
+    account_id: str = ""
+    account_name: str = ""
+    account_is_practice: Optional[bool] = None
 
 
 @dataclass 
@@ -81,6 +88,10 @@ class RiskManager:
         self._current_regime: str = ""
         self._current_event_tags: list[str] = []
         self._current_strategy: str = "WEIGHTED_SCORE_MATRIX"
+        self._current_trade_id: str = ""
+        self._current_position_id: str = ""
+        self._current_decision_id: str = ""
+        self._current_attempt_id: str = ""
         self._blackout_active: bool = False
         self._blackout_reason: str = ""
         self._volatility_history: deque = deque(maxlen=20)
@@ -458,6 +469,16 @@ class RiskManager:
     
     def record_trade(self, trade: TradeRecord):
         """Record a completed trade and update metrics."""
+        if not trade.account_id:
+            try:
+                from src.server import get_state
+
+                state = get_state()
+                trade.account_id = state.account_id or ""
+                trade.account_name = state.account_name or ""
+                trade.account_is_practice = state.account_is_practice
+            except Exception:
+                logger.debug("Failed to enrich trade with account context", exc_info=True)
         self._trade_history.append(trade)
         self._daily_trades += 1
         self._trades_this_hour.append(trade.exit_time)
@@ -484,6 +505,13 @@ class RiskManager:
                 "strategy": trade.strategy,
                 "regime": trade.regime,
                 "event_tags": list(trade.event_tags or []),
+                "trade_id": trade.trade_id,
+                "position_id": trade.position_id,
+                "decision_id": trade.decision_id,
+                "attempt_id": trade.attempt_id,
+                "account_id": trade.account_id,
+                "account_name": trade.account_name,
+                "account_is_practice": trade.account_is_practice,
             },
             event_time=trade.exit_time,
             action="record_trade",
@@ -513,6 +541,10 @@ class RiskManager:
             strategy=self._current_strategy,
             regime=self._current_regime,
             event_tags=list(self._current_event_tags),
+            trade_id=self._current_trade_id,
+            position_id=self._current_position_id,
+            decision_id=self._current_decision_id,
+            attempt_id=self._current_attempt_id,
         )
 
     def _clear_position_tracking(self) -> None:
@@ -523,6 +555,10 @@ class RiskManager:
         self._current_regime = ""
         self._current_event_tags = []
         self._current_strategy = "WEIGHTED_SCORE_MATRIX"
+        self._current_trade_id = ""
+        self._current_position_id = ""
+        self._current_decision_id = ""
+        self._current_attempt_id = ""
     
     def open_position(
         self,
@@ -534,6 +570,10 @@ class RiskManager:
         event_tags: Optional[list[str]] = None,
         strategy: str = "WEIGHTED_SCORE_MATRIX",
         current_time: Optional[datetime] = None,
+        trade_id: str = "",
+        position_id: str = "",
+        decision_id: str = "",
+        attempt_id: str = "",
     ):
         """Record position opening."""
         self.observe_time(current_time)
@@ -545,10 +585,14 @@ class RiskManager:
         self._current_event_tags = list(event_tags or [])
         self._current_strategy = strategy
         self._current_position_pnl = 0
+        self._current_trade_id = trade_id
+        self._current_position_id = position_id
+        self._current_decision_id = decision_id
+        self._current_attempt_id = attempt_id
         logger.info("Position opened: %s contracts %s at %s", contracts, "long" if direction > 0 else "short", entry_price)
         self._record_event(
             event_type="position_opened",
-            payload={"contracts": contracts, "entry_price": entry_price, "direction": direction, "regime": regime, "event_tags": list(event_tags or []), "strategy": strategy},
+            payload={"contracts": contracts, "entry_price": entry_price, "direction": direction, "regime": regime, "event_tags": list(event_tags or []), "strategy": strategy, "trade_id": trade_id, "position_id": position_id, "decision_id": decision_id, "attempt_id": attempt_id},
             event_time=self._coerce_time(current_time),
             action="open_position",
             reason="position_opened",
@@ -576,6 +620,10 @@ class RiskManager:
         event_tags: Optional[list[str]] = None,
         strategy: str = "WEIGHTED_SCORE_MATRIX",
         current_time: Optional[datetime] = None,
+        trade_id: str = "",
+        position_id: str = "",
+        decision_id: str = "",
+        attempt_id: str = "",
     ) -> list[TradeRecord]:
         self.observe_time(current_time)
         current_time_value = self._coerce_time(current_time)
@@ -585,6 +633,10 @@ class RiskManager:
         if prior_position == signed_position:
             if signed_position != 0 and entry_price > 0:
                 self._position_entry_price = entry_price
+                self._current_trade_id = trade_id or self._current_trade_id
+                self._current_position_id = position_id or self._current_position_id
+                self._current_decision_id = decision_id or self._current_decision_id
+                self._current_attempt_id = attempt_id or self._current_attempt_id
             return completed
 
         if prior_position == 0:
@@ -598,6 +650,10 @@ class RiskManager:
                     event_tags=event_tags,
                     strategy=strategy,
                     current_time=current_time_value,
+                    trade_id=trade_id,
+                    position_id=position_id,
+                    decision_id=decision_id,
+                    attempt_id=attempt_id,
                 )
             return completed
 
@@ -630,6 +686,10 @@ class RiskManager:
                 event_tags=event_tags,
                 strategy=strategy,
                 current_time=current_time_value,
+                trade_id=trade_id,
+                position_id=position_id,
+                decision_id=decision_id,
+                attempt_id=attempt_id,
             )
             return completed
 
@@ -777,6 +837,10 @@ class RiskManager:
         self._current_position_pnl = 0
         self._last_market_price = None
         self._last_market_price_time = None
+        self._current_trade_id = ""
+        self._current_position_id = ""
+        self._current_decision_id = ""
+        self._current_attempt_id = ""
         if clear_history:
             self._trade_history = []
 

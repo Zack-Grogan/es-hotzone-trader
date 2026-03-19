@@ -1,6 +1,7 @@
 """CLI commands module."""
 import click
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+import hashlib
 import logging
 import json
 from logging.handlers import RotatingFileHandler
@@ -14,6 +15,17 @@ import time
 from typing import Any, Optional
 
 from src.config import get_config, load_config, set_config
+from src.cli.launchd import (
+    install_launch_agent,
+    launch_agent_status,
+    read_launchd_environment,
+    restart_launch_agent,
+    start_launch_agent,
+    stderr_log_path,
+    stdout_log_path,
+    stop_launch_agent,
+    uninstall_launch_agent,
+)
 from src.server import get_server, get_state, set_state
 from src.market import get_client
 from src.execution import get_executor
@@ -21,6 +33,8 @@ from src.engine import ReplayRunner, get_scheduler, get_risk_manager, get_tradin
 from src.observability import get_observability_store
 from src.observability.provenance import collect_run_provenance
 from src.bridge import start_railway_bridge
+from src.bridge.outbox import RailwayOutbox
+from src.bridge.railway_bridge import rebuild_outbox_from_observability
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +59,43 @@ class _ConsoleFormatter(logging.Formatter):
             return rendered
         color = self.COLORS.get(record.levelno)
         return f"{color}{rendered}{self.RESET}" if color else rendered
+
+
+class _ObservabilityLogHandler(logging.Handler):
+    _local = threading.local()
+    _formatter = logging.Formatter()
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if getattr(self._local, "active", False):
+            return
+        if record.name.startswith("src.observability.store"):
+            return
+        try:
+            self._local.active = True
+            exception_text = None
+            if record.exc_info:
+                exception_text = self._formatter.formatException(record.exc_info)
+            payload = {
+                "logged_at": datetime.fromtimestamp(record.created, UTC).isoformat(),
+                "logger_name": record.name,
+                "level": record.levelname,
+                "source": "local-runtime",
+                "service_name": "es-hotzone-trader",
+                "process_id": os.getpid(),
+                "line_hash": hashlib.sha1(
+                    f"{record.pathname}:{record.lineno}:{record.getMessage()}".encode("utf-8")
+                ).hexdigest()[:16],
+                "thread_name": record.threadName,
+                "message": record.getMessage(),
+                "exception_text": exception_text,
+                "pathname": record.pathname,
+                "lineno": record.lineno,
+            }
+            get_observability_store().record_runtime_log(payload)
+        except Exception:
+            pass
+        finally:
+            self._local.active = False
 
 
 def _log_uncaught_exception(exc_type, exc_value, exc_traceback) -> None:
@@ -134,9 +185,13 @@ def _configure_logging(cfg) -> Path:
     file_handler.setLevel(log_level)
     file_handler.setFormatter(formatter)
 
+    observability_handler = _ObservabilityLogHandler()
+    observability_handler.setLevel(log_level)
+
     root_logger.setLevel(log_level)
     root_logger.addHandler(stream_handler)
     root_logger.addHandler(file_handler)
+    root_logger.addHandler(observability_handler)
     logging.captureWarnings(True)
     sys.excepthook = _log_uncaught_exception
     threading.excepthook = _log_thread_exception
@@ -667,6 +722,15 @@ def _record_runtime_provenance(cfg, observability, *, config_path: str, log_path
         debug_url=urls["debug_url"],
         mcp_url=urls["mcp_url"],
     )
+    debug_state = _fetch_remote_debug_state(cfg) or {}
+    account_payload = debug_state.get("account") if isinstance(debug_state.get("account"), dict) else {}
+    if account_payload:
+        manifest["account"] = {
+            "id": account_payload.get("id"),
+            "name": account_payload.get("name"),
+            "daily_pnl": account_payload.get("daily_pnl"),
+            "is_practice": account_payload.get("is_practice"),
+        }
     manifest["run_id"] = observability.get_run_id()
     if getattr(cfg.observability, "capture_run_provenance", True):
         observability.record_run_manifest(manifest)
@@ -694,6 +758,110 @@ def _record_runtime_provenance(cfg, observability, *, config_path: str, log_path
         last_backfill=backfill_result,
     )
     return manifest, backfill_result
+
+
+def _sync_account_trade_history(
+    cfg,
+    observability,
+    *,
+    source: str,
+    lookback_hours: int,
+    run_id: Optional[str] = None,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "source": source,
+        "run_id": run_id or observability.get_run_id(),
+        "requested_lookback_hours": int(lookback_hours),
+        "account_id": None,
+        "account_name": None,
+        "account_mode": None,
+        "checked": 0,
+        "imported": 0,
+    }
+    try:
+        client = get_client()
+        if not client._access_token and not client.authenticate():
+            result["error"] = "authentication_failed"
+            return result
+        account = client.get_account()
+        if account is None:
+            result["error"] = "account_unavailable"
+            return result
+        result["account_id"] = account.account_id
+        result["account_name"] = account.name
+        result["account_mode"] = "practice" if account.is_practice else "live"
+        window_hours = max(int(lookback_hours), 1)
+        end_time = datetime.now(UTC)
+        start_time = end_time - timedelta(hours=window_hours)
+        broker_trades = client.search_trades(
+            start_timestamp=start_time.isoformat(),
+            end_timestamp=end_time.isoformat(),
+            account_id=int(account.account_id),
+        )
+        result["checked"] = len(broker_trades)
+        for trade in broker_trades:
+            payload = dict(trade)
+            payload.setdefault("run_id", run_id or observability.get_run_id())
+            payload.setdefault("account_id", account.account_id)
+            payload.setdefault("account_name", account.name)
+            payload.setdefault("account_is_practice", account.is_practice)
+            if observability.record_account_trade(payload, run_id=run_id, source=source):
+                result["imported"] += 1
+        return result
+    except Exception as exc:
+        logger.exception("Failed to sync account trade history")
+        result["error"] = str(exc)
+        return result
+
+
+def _print_json(payload: Any) -> None:
+    click.echo(json.dumps(payload, indent=2, default=str))
+
+
+def _tail_file_lines(path: Path, *, lines: int = 100) -> list[str]:
+    if not path.exists():
+        return []
+    try:
+        content = path.read_text(encoding="utf-8").splitlines()
+        return content[-max(int(lines), 1):]
+    except Exception:
+        logger.exception("Failed to read log file at %s", path)
+        return []
+
+
+def _service_doctor_payload(cfg) -> dict[str, Any]:
+    log_path = _resolve_log_path(cfg)
+    runtime_status = _read_runtime_status(cfg, log_path)
+    observability = get_observability_store()
+    outbox = RailwayOutbox(cfg.observability.outbox_path)
+    try:
+        launchd_env = read_launchd_environment()
+        return {
+            "launchd": launch_agent_status(),
+            "runtime_status": runtime_status,
+            "remote_health": _fetch_remote_health(cfg),
+            "remote_debug": _fetch_remote_debug_state(cfg),
+            "observability_db_path": observability.get_db_path(),
+            "outbox_stats": outbox.get_queue_stats(),
+            "delivery_state": outbox.get_delivery_state(),
+            "log_path": str(log_path),
+            "launchd_stdout_log": str(stdout_log_path()),
+            "launchd_stderr_log": str(stderr_log_path()),
+            "bridge_url": cfg.observability.railway_ingest_url,
+            "internal_auth_configured": bool(
+                (
+                    os.environ.get("GTRADE_INTERNAL_API_TOKEN")
+                    or launchd_env.get("GTRADE_INTERNAL_API_TOKEN")
+                    or cfg.observability.internal_api_token
+                    or ""
+                ).strip()
+            ),
+            "legacy_ingest_key_configured": bool(
+                (os.environ.get("RAILWAY_INGEST_API_KEY") or cfg.observability.railway_ingest_api_key or "").strip()
+            ),
+        }
+    finally:
+        outbox.close()
 
 
 @click.group()
@@ -773,6 +941,26 @@ def start(config: Optional[str]):
         replay_summary=None,
     )
     _record_runtime_provenance(cfg, observability, config_path=config_path, log_path=log_path, data_mode="live")
+    if getattr(cfg.observability, "sync_account_trade_history_on_startup", False):
+        account_trade_sync = _sync_account_trade_history(
+            cfg,
+            observability,
+            source="startup_account_history_sync",
+            lookback_hours=getattr(cfg.observability, "account_trade_history_lookback_hours", 168),
+        )
+        observability.record_event(
+            category="system",
+            event_type="account_trade_history_sync",
+            source=__name__,
+            payload=account_trade_sync,
+            symbol=cfg.symbols[0] if cfg.symbols else None,
+            action="sync_account_trade_history",
+            reason="startup_account_history_sync",
+        )
+        observability.update_run_manifest_payload(
+            observability.get_run_id(),
+            {"last_account_trade_sync": account_trade_sync},
+        )
     
     # Show current zone
     zone = scheduler.get_current_zone()
@@ -1133,6 +1321,206 @@ def events(limit: int, category: Optional[str], event_type: Optional[str], since
         search=search,
     )
     click.echo(json.dumps(rows, indent=2, default=str))
+
+
+@cli.group()
+def service():
+    """Manage the macOS launchd service wrapper."""
+
+
+@service.command("install")
+@click.option("--config", type=click.Path(exists=True), help="Config file path embedded into the launchd plist")
+def service_install(config: Optional[str]) -> None:
+    result = install_launch_agent(_resolve_config_path(config) if config else None)
+    if not result.ok:
+        raise click.ClickException(result.message)
+    click.echo(result.message)
+
+
+@service.command("uninstall")
+def service_uninstall() -> None:
+    result = uninstall_launch_agent()
+    if not result.ok:
+        raise click.ClickException(result.message)
+    click.echo(result.message)
+
+
+@service.command("start")
+def service_start() -> None:
+    result = start_launch_agent()
+    if not result.ok:
+        raise click.ClickException(result.message)
+    click.echo(result.message)
+
+
+@service.command("stop")
+def service_stop() -> None:
+    result = stop_launch_agent()
+    if not result.ok:
+        raise click.ClickException(result.message)
+    click.echo(result.message)
+
+
+@service.command("restart")
+def service_restart() -> None:
+    result = restart_launch_agent()
+    if not result.ok:
+        raise click.ClickException(result.message)
+    click.echo(result.message)
+
+
+@service.command("status")
+def service_status() -> None:
+    cfg = get_config()
+    _print_json(_service_doctor_payload(cfg))
+
+
+@service.command("logs")
+@click.option("--lines", default=100, show_default=True, type=int, help="Number of lines to tail")
+@click.option("--source", "source_name", default="app", show_default=True, type=click.Choice(["app", "launchd-stdout", "launchd-stderr"]), help="Log source to display")
+def service_logs(lines: int, source_name: str) -> None:
+    cfg = get_config()
+    source_map = {
+        "app": _resolve_log_path(cfg),
+        "launchd-stdout": stdout_log_path(),
+        "launchd-stderr": stderr_log_path(),
+    }
+    path = source_map[source_name]
+    rows = _tail_file_lines(path, lines=lines)
+    if not rows:
+        click.echo(f"No log lines available at {path}")
+        return
+    click.echo("\n".join(rows))
+
+
+@service.command("doctor")
+def service_doctor() -> None:
+    cfg = get_config()
+    _print_json(_service_doctor_payload(cfg))
+
+
+@cli.group()
+def db():
+    """Inspect local durability and recovery state."""
+
+
+@db.command("runs")
+@click.option("--limit", default=25, show_default=True, type=int)
+@click.option("--search", type=str)
+def db_runs(limit: int, search: Optional[str]) -> None:
+    rows = get_observability_store().query_run_manifests(limit=limit, search=search)
+    _print_json(rows)
+
+
+@db.command("events")
+@click.option("--limit", default=100, show_default=True, type=int)
+@click.option("--category", type=str)
+@click.option("--event-type", type=str)
+@click.option("--search", type=str)
+@click.option("--run-id", type=str)
+def db_events(limit: int, category: Optional[str], event_type: Optional[str], search: Optional[str], run_id: Optional[str]) -> None:
+    rows = get_observability_store().query_events(
+        limit=limit,
+        category=category,
+        event_type=event_type,
+        search=search,
+        run_id=run_id,
+    )
+    _print_json(rows)
+
+
+@db.command("snapshots")
+@click.option("--limit", default=100, show_default=True, type=int)
+@click.option("--kind", default="state", show_default=True, type=click.Choice(["state", "decision", "market", "order"]))
+@click.option("--run-id", type=str)
+@click.option("--search", type=str)
+def db_snapshots(limit: int, kind: str, run_id: Optional[str], search: Optional[str]) -> None:
+    store = get_observability_store()
+    if kind == "state":
+        rows = store.query_state_snapshots(limit=limit, run_id=run_id, search=search)
+    elif kind == "decision":
+        rows = store.query_decision_snapshots(limit=limit, run_id=run_id, search=search)
+    elif kind == "market":
+        rows = store.query_market_tape(limit=limit, run_id=run_id, search=search)
+    else:
+        rows = store.query_order_lifecycle(limit=limit, run_id=run_id, search=search)
+    _print_json(rows)
+
+
+@db.command("bridge-health")
+@click.option("--limit", default=100, show_default=True, type=int)
+@click.option("--run-id", type=str)
+@click.option("--search", type=str)
+def db_bridge_health(limit: int, run_id: Optional[str], search: Optional[str]) -> None:
+    rows = get_observability_store().query_bridge_health(limit=limit, run_id=run_id, search=search)
+    _print_json(rows)
+
+
+@db.command("logs")
+@click.option("--limit", default=100, show_default=True, type=int)
+@click.option("--run-id", type=str)
+@click.option("--level", "level_name", type=str)
+@click.option("--search", type=str)
+def db_logs(limit: int, run_id: Optional[str], level_name: Optional[str], search: Optional[str]) -> None:
+    rows = get_observability_store().query_runtime_logs(limit=limit, run_id=run_id, level=level_name, search=search)
+    _print_json(rows)
+
+
+@db.command("account-trades")
+@click.option("--limit", default=100, show_default=True, type=int)
+@click.option("--run-id", type=str)
+@click.option("--account-id", type=str)
+@click.option("--search", type=str)
+def db_account_trades(limit: int, run_id: Optional[str], account_id: Optional[str], search: Optional[str]) -> None:
+    rows = get_observability_store().query_account_trades(limit=limit, run_id=run_id, account_id=account_id, search=search)
+    _print_json(rows)
+
+
+@db.command("sync-account-trades")
+@click.option("--hours", default=168, show_default=True, type=int, help="Look back this many hours in broker account history.")
+def db_sync_account_trades(hours: int) -> None:
+    cfg = get_config()
+    observability = get_observability_store()
+    payload = _sync_account_trade_history(
+        cfg,
+        observability,
+        source="cli_account_history_sync",
+        lookback_hours=hours,
+    )
+    observability.record_event(
+        category="system",
+        event_type="account_trade_history_sync",
+        source=__name__,
+        payload=payload,
+        symbol=cfg.symbols[0] if cfg.symbols else None,
+        action="sync_account_trade_history",
+        reason="cli_account_history_sync",
+    )
+    _print_json(payload)
+
+
+@db.command("replay-missing")
+@click.option("--run-id", type=str, help="Replay a single run. Default: all local runs newer than the delivery cursor.")
+@click.option("--include-sent", is_flag=True, help="Ignore delivery cursors and replay all matching local records.")
+@click.option("--limit-per-kind", default=1000, show_default=True, type=int)
+def db_replay_missing(run_id: Optional[str], include_sent: bool, limit_per_kind: int) -> None:
+    cfg = get_config()
+    outbox = RailwayOutbox(cfg.observability.outbox_path)
+    try:
+        counts = rebuild_outbox_from_observability(
+            outbox,
+            run_id=run_id,
+            include_sent=include_sent,
+            limit_per_kind=limit_per_kind,
+        )
+        payload = {
+            "replayed": counts,
+            "outbox_stats": outbox.get_queue_stats(),
+            "delivery_state": outbox.get_delivery_state(),
+        }
+    finally:
+        outbox.close()
+    _print_json(payload)
 
 
 @cli.command()

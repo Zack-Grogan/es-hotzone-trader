@@ -5,6 +5,7 @@ import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
 import logging
+import os
 from pathlib import Path
 import threading
 import time
@@ -175,11 +176,29 @@ class TradingEngine:
         self._protection_mode: str = "static"
         self._last_dynamic_exit_update_at: float = 0.0
         self._last_sizing_telemetry: Dict[str, Any] = {}
+        self._decision_sequence: int = 0
+        self._attempt_sequence: int = 0
+        self._position_sequence: int = 0
+        self._trade_sequence: int = 0
+        self._pending_decision_id: Optional[str] = None
+        self._pending_attempt_id: Optional[str] = None
+        self._pending_position_id: Optional[str] = None
+        self._pending_trade_id: Optional[str] = None
+        self._current_position_id: Optional[str] = None
+        self._current_trade_id: Optional[str] = None
+        self._last_decision_id: Optional[str] = None
+        self._last_attempt_id: Optional[str] = None
         self.observability = get_observability_store()
 
     @property
     def running(self) -> bool:
         return self._running
+
+    def _next_stable_id(self, kind: str) -> str:
+        sequence_name = f"_{kind}_sequence"
+        sequence = getattr(self, sequence_name, 0) + 1
+        setattr(self, sequence_name, sequence)
+        return f"{self.observability.get_run_id()}:{kind}:{sequence}"
 
     def _record_event(
         self,
@@ -222,12 +241,25 @@ class TradingEngine:
         order_type: Optional[str] = None,
         limit_price: Optional[float] = None,
         order_id: Optional[str] = None,
+        decision_id: Optional[str] = None,
+        attempt_id: Optional[str] = None,
+        position_id: Optional[str] = None,
+        trade_id: Optional[str] = None,
     ) -> None:
+        decision_id = decision_id or self._next_stable_id("decision")
+        self._last_decision_id = decision_id
+        if attempt_id:
+            self._last_attempt_id = attempt_id
         dominant_side = "long" if decision.long_score >= decision.short_score else "short"
         dominant_score = decision.long_score if dominant_side == "long" else decision.short_score
         opposing_score = decision.short_score if dominant_side == "long" else decision.long_score
         event_time = current_time.to_pydatetime() if hasattr(current_time, "to_pydatetime") else current_time
         payload = {
+            "decision_id": decision_id,
+            "attempt_id": attempt_id,
+            "position_id": position_id or self._current_position_id,
+            "trade_id": trade_id or self._current_trade_id,
+            "symbol": self.symbol,
             "zone_state": zone.state.value if zone else ("active" if self.config.strategy.trade_outside_hotzones else "inactive"),
             "decision_reason": decision.reason,
             "long_score": decision.long_score,
@@ -261,6 +293,24 @@ class TradingEngine:
                 "spread_regime": decision.feature_snapshot.long_features.get("spread_regime", 0.0),
                 "volume_pace": decision.feature_snapshot.long_features.get("volume_pace", 0.0),
             },
+            "feature_snapshot": {
+                "zone_name": decision.feature_snapshot.zone_name,
+                "current_price": decision.feature_snapshot.current_price,
+                "atr_value": decision.feature_snapshot.atr_value,
+                "long_features": decision.feature_snapshot.long_features,
+                "short_features": decision.feature_snapshot.short_features,
+                "flat_features": decision.feature_snapshot.flat_features,
+                "signed_features": decision.feature_snapshot.signed_features,
+                "diagnostics": decision.feature_snapshot.diagnostics,
+                "mean_reversion_ready_long": decision.feature_snapshot.mean_reversion_ready_long,
+                "mean_reversion_ready_short": decision.feature_snapshot.mean_reversion_ready_short,
+                "execution_tradeable": decision.feature_snapshot.execution_tradeable,
+                "active_session": decision.feature_snapshot.active_session,
+                "regime_state": decision.feature_snapshot.regime_state,
+                "regime_reason": decision.feature_snapshot.regime_reason,
+                "event_tags": list(decision.feature_snapshot.event_tags),
+                "capabilities": decision.feature_snapshot.capabilities,
+            },
             "outcome": outcome,
             "outcome_reason": outcome_reason,
             "contracts": contracts,
@@ -270,6 +320,14 @@ class TradingEngine:
             "entry_guard": dict(self._last_entry_guard_snapshot),
             "unresolved_entry": self._unresolved_entry_snapshot(),
         }
+        self.observability.record_decision_snapshot(
+            {
+                "decided_at": event_time,
+                "run_id": self.observability.get_run_id(),
+                "process_id": os.getpid(),
+                **payload,
+            }
+        )
         self._record_event(
             category="decision",
             event_type="decision_evaluated",
@@ -330,6 +388,18 @@ class TradingEngine:
             self._protection_mode = "static"
             self._last_dynamic_exit_update_at = 0.0
             self._last_sizing_telemetry = {}
+            self._decision_sequence = 0
+            self._attempt_sequence = 0
+            self._position_sequence = 0
+            self._trade_sequence = 0
+            self._pending_decision_id = None
+            self._pending_attempt_id = None
+            self._pending_position_id = None
+            self._pending_trade_id = None
+            self._current_position_id = None
+            self._current_trade_id = None
+            self._last_decision_id = None
+            self._last_attempt_id = None
             self._watchdog_state = WatchdogState()
             self._last_unresolved_reconcile_at = 0.0
             self.risk_manager.reset_state(clear_history=clear_history)
@@ -1190,6 +1260,14 @@ class TradingEngine:
 
         order_type, limit_price = self._choose_entry_order(decision.side)
         expected_fill_price = limit_price if limit_price is not None else current_price
+        decision_id = self._next_stable_id("decision")
+        attempt_id = self._next_stable_id("attempt")
+        position_id = self._next_stable_id("position")
+        trade_id = self._next_stable_id("trade")
+        self._pending_decision_id = decision_id
+        self._pending_attempt_id = attempt_id
+        self._pending_position_id = position_id
+        self._pending_trade_id = trade_id
         guard_allows_entry, guard_reason, guard_snapshot = self._evaluate_live_entry_guard(
             side=decision.side,
             decision_price=current_price,
@@ -1235,12 +1313,24 @@ class TradingEngine:
                 limit_price=limit_price,
             )
             return
+        decision_id = self._next_stable_id("decision")
+        attempt_id = self._next_stable_id("attempt")
+        position_id = self._next_stable_id("position")
+        trade_id = self._next_stable_id("trade")
+        self._pending_decision_id = decision_id
+        self._pending_attempt_id = attempt_id
+        self._pending_position_id = position_id
+        self._pending_trade_id = trade_id
         order = self.executor.place_order(
             symbol=self.symbol,
             quantity=contracts,
             side=decision.side,
             order_type=order_type,
             limit_price=limit_price,
+            decision_id=decision_id,
+            attempt_id=attempt_id,
+            position_id=position_id,
+            trade_id=trade_id,
         )
         if order is None:
             self._record_decision_event(
@@ -1254,7 +1344,15 @@ class TradingEngine:
                 contracts=contracts,
                 order_type=order_type,
                 limit_price=limit_price,
+                decision_id=decision_id,
+                attempt_id=attempt_id,
+                position_id=position_id,
+                trade_id=trade_id,
             )
+            self._pending_decision_id = None
+            self._pending_attempt_id = None
+            self._pending_position_id = None
+            self._pending_trade_id = None
             return
 
         self._stop_loss = decision.stop_loss
@@ -1271,6 +1369,23 @@ class TradingEngine:
             decision_price=current_price,
             expected_fill_price=expected_fill_price,
         )
+        self._record_decision_event(
+            decision,
+            zone=zone,
+            current_time=current_time,
+            current_price=current_price,
+            allow_entries=allow_entries,
+            outcome="order_submitted",
+            outcome_reason="entry_order_placed",
+            contracts=contracts,
+            order_type=order_type,
+            limit_price=limit_price,
+            order_id=order.order_id,
+            decision_id=decision_id,
+            attempt_id=attempt_id,
+            position_id=position_id,
+            trade_id=trade_id,
+        )
         set_state(
             last_signal={
                 "direction": decision.action,
@@ -1281,6 +1396,10 @@ class TradingEngine:
                 "zone": decision.zone_name,
                 "regime": decision.feature_snapshot.regime_state,
                 "expected_fill_price": self._pending_expected_fill_price,
+                "decision_id": decision_id,
+                "attempt_id": attempt_id,
+                "position_id": position_id,
+                "trade_id": trade_id,
             },
             last_entry_reason=decision.reason,
         )
@@ -1454,13 +1573,33 @@ class TradingEngine:
         if self._mock_mode:
             signed_position = self.executor.get_position(self.symbol)
             entry_price = self.executor.get_average_price()
+            position_authoritative = True
         else:
             position = self.client.get_position(self.symbol)
             signed_position = position.quantity
             entry_price = position.entry_price
+            position_authoritative = getattr(position, "authoritative", True)
 
         event_time = self._current_event_time()
         with self._lock:
+            if not self._mock_mode and not position_authoritative:
+                if signed_position != self._last_position:
+                    self._record_event(
+                        category="execution",
+                        event_type="position_sync_skipped_unavailable",
+                        payload={
+                            "signed_position": signed_position,
+                            "last_position": self._last_position,
+                        },
+                        event_time=event_time,
+                        action="sync_position",
+                        reason="position_lookup_unavailable",
+                    )
+                self._position_sync_requested = False
+                self._last_reconciliation_at = event_time
+                self._last_reconciliation_reason = "position_lookup_unavailable"
+                return
+
             if not self._mock_mode and signed_position == 0 and self._unresolved_entry_submission_count > 0:
                 broker_orders, order_error = self.client.get_open_orders_snapshot(self.symbol)
                 if order_error is None and (broker_orders is None or len(broker_orders) == 0):
@@ -1502,6 +1641,10 @@ class TradingEngine:
                 event_tags = self._latest_event_context.active_tags if self._latest_event_context else []
                 zone_name = self._pending_entry_zone or self._active_zone_name or (zone.name if zone else ("Outside" if self.config.strategy.trade_outside_hotzones else "sync_recovery"))
                 prior_position = self._last_position
+                position_id = self._pending_position_id or self._current_position_id or self._next_stable_id("position")
+                trade_id = self._pending_trade_id or self._current_trade_id or self._next_stable_id("trade")
+                decision_id = self._pending_decision_id or self._last_decision_id
+                attempt_id = self._pending_attempt_id or self._last_attempt_id
 
                 self.risk_manager.sync_position(
                     signed_position=signed_position,
@@ -1512,10 +1655,16 @@ class TradingEngine:
                     event_tags=event_tags,
                     strategy="WEIGHTED_SCORE_MATRIX",
                     current_time=event_time,
+                    decision_id=decision_id,
+                    attempt_id=attempt_id,
+                    position_id=position_id,
+                    trade_id=trade_id,
                 )
                 self._clear_unresolved_entry_state("position_transition_confirmed")
 
                 if prior_position == 0 and signed_position != 0:
+                    self._current_position_id = position_id
+                    self._current_trade_id = trade_id
                     self._position_entry_time = pd.Timestamp(event_time)
                     self._position_high_water = actual_entry_price
                     self._position_low_water = actual_entry_price
@@ -1526,6 +1675,10 @@ class TradingEngine:
                         direction=1 if signed_position > 0 else -1,
                         stop_price=self._stop_loss,
                         take_profit=self._take_profit,
+                        decision_id=decision_id,
+                        attempt_id=attempt_id,
+                        position_id=position_id,
+                        trade_id=trade_id,
                     )
                     self._last_entry_fill_price = actual_entry_price
                     if self._pending_expected_fill_price is not None and actual_entry_price:
@@ -1560,6 +1713,10 @@ class TradingEngine:
                             "event_tags": event_tags,
                             "fill_drift_ticks": self._last_fill_drift_ticks,
                             "protection_attach_latency_seconds": self._last_protection_attach_latency_seconds,
+                            "decision_id": decision_id,
+                            "attempt_id": attempt_id,
+                            "position_id": position_id,
+                            "trade_id": trade_id,
                         },
                         event_time=event_time,
                         action="entry_fill",
@@ -1568,6 +1725,10 @@ class TradingEngine:
                     )
                     self._pending_expected_fill_price = None
                     self._pending_entry_submitted_at = None
+                    self._pending_decision_id = None
+                    self._pending_attempt_id = None
+                    self._pending_position_id = None
+                    self._pending_trade_id = None
                 elif prior_position != 0 and signed_position == 0:
                     protective_reason = self.executor.pop_last_protective_fill_reason()
                     if protective_reason == "stop_loss":
@@ -1578,6 +1739,8 @@ class TradingEngine:
                         set_state(last_exit_reason=self._last_exit_reason)
                     self.executor.clear_protection(self.symbol)
                     self.executor.mark_position_flat()
+                    close_position_id = self._current_position_id or position_id
+                    close_trade_id = self._current_trade_id or trade_id
                     logger.info(
                         "execution_trace event=exit reason=%s fill=%s zone=%s regime=%s",
                         self._last_exit_reason or "flat_sync",
@@ -1595,6 +1758,10 @@ class TradingEngine:
                             "zone": zone_name,
                             "regime_state": regime_state,
                             "event_tags": event_tags,
+                            "decision_id": decision_id,
+                            "attempt_id": attempt_id,
+                            "position_id": close_position_id,
+                            "trade_id": close_trade_id,
                         },
                         event_time=event_time,
                         action="exit_fill",
@@ -1609,6 +1776,12 @@ class TradingEngine:
                     self._position_high_water = None
                     self._position_low_water = None
                     self._protection_mode = "static"
+                    self._current_position_id = None
+                    self._current_trade_id = None
+                    self._pending_decision_id = None
+                    self._pending_attempt_id = None
+                    self._pending_position_id = None
+                    self._pending_trade_id = None
                 else:
                     self.executor.mark_position_open()
                     self.executor.ensure_protection(
@@ -1617,6 +1790,8 @@ class TradingEngine:
                         direction=1 if signed_position > 0 else -1,
                         stop_price=self._stop_loss,
                         take_profit=self._take_profit,
+                        position_id=self._current_position_id,
+                        trade_id=self._current_trade_id,
                     )
                     if prior_position * signed_position < 0:
                         self._position_entry_time = pd.Timestamp(event_time)
@@ -1634,6 +1809,10 @@ class TradingEngine:
                             "zone": zone_name,
                             "regime_state": regime_state,
                             "event_tags": event_tags,
+                            "decision_id": decision_id,
+                            "attempt_id": attempt_id,
+                            "position_id": self._current_position_id or position_id,
+                            "trade_id": self._current_trade_id or trade_id,
                         },
                         event_time=event_time,
                         action="position_adjustment",
@@ -1644,6 +1823,9 @@ class TradingEngine:
                 self._position_sync_requested = False
                 self._last_reconciliation_at = event_time
                 self._last_reconciliation_reason = "position_sync"
+            self._position_sync_requested = False
+            self._last_reconciliation_at = event_time
+            self._last_reconciliation_reason = "position_sync"
 
     def _refresh_dynamic_exit(self) -> None:
         """Update stop to breakeven/profit-lock/trailing when price moved in our favor; idempotent protection refresh."""
@@ -1865,6 +2047,7 @@ class TradingEngine:
                 "market_stream_error": self.client.get_last_stream_error(),
             },
         )
+        self.observability.record_state_snapshot(get_state().to_dict(), event_time=self._current_event_time())
 
     def _current_event_time(self) -> datetime:
         if self._latest_market_data is not None and self._latest_market_data.timestamp is not None:

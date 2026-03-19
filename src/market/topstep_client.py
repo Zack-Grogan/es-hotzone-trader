@@ -5,7 +5,7 @@ import logging
 import os
 import time
 from concurrent.futures import TimeoutError as FutureTimeoutError
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Dict, Any, Callable
@@ -63,6 +63,7 @@ class Position:
     current_price: float = 0
     unrealized_pnl: float = 0
     realized_pnl: float = 0
+    authoritative: bool = True
     
     @property
     def is_flat(self) -> bool:
@@ -1191,7 +1192,7 @@ class TopstepClient:
 
     def get_position(self, symbol: str = "ES") -> Position:
         """Get position for specific symbol."""
-        positions, _ = self.get_positions_snapshot()
+        positions, error = self.get_positions_snapshot()
         if positions and symbol in positions:
             return positions[symbol]
 
@@ -1200,6 +1201,19 @@ class TopstepClient:
             normalized = str(contract_id).upper()
             if requested in normalized or normalized in requested:
                 return position
+
+        if error:
+            with self._state_lock:
+                cached_positions = dict(self._positions)
+            if cached_positions:
+                if symbol in cached_positions:
+                    return replace(cached_positions[symbol], authoritative=False)
+                for contract_id, position in cached_positions.items():
+                    normalized = str(contract_id).upper()
+                    if requested in normalized or normalized in requested:
+                        return replace(position, authoritative=False)
+            logger.warning("Position lookup failed for %s with no authoritative broker snapshot: %s", symbol, error)
+            return Position(symbol=symbol, authoritative=False)
 
         return Position(symbol=symbol)
     
@@ -1503,6 +1517,26 @@ class TopstepClient:
                 for alias in aliases:
                     if alias:
                         self._market_data[alias] = quote
+            self.observability.record_market_tick(
+                {
+                    "run_id": self.observability.get_run_id(),
+                    "symbol": root_symbol,
+                    "contract_id": contract_id,
+                    "bid": quote.bid,
+                    "ask": quote.ask,
+                    "last": quote.last,
+                    "volume": quote.volume,
+                    "bid_size": quote.bid_size,
+                    "ask_size": quote.ask_size,
+                    "last_size": quote.last_size,
+                    "volume_is_cumulative": quote.volume_is_cumulative,
+                    "quote_is_synthetic": quote.quote_is_synthetic,
+                    "trade_side": quote.trade_side,
+                    "latency_ms": quote.latency_ms,
+                    "source": "GatewayQuote",
+                    "timestamp": quote.timestamp,
+                }
+            )
             
             if not self._stream_ready.is_set():
                 self._stream_error = None
@@ -1552,6 +1586,26 @@ class TopstepClient:
                 for alias in {contract_id, root_symbol, quote.symbol}:
                     if alias:
                         self._market_data[alias] = quote
+            self.observability.record_market_tick(
+                {
+                    "run_id": self.observability.get_run_id(),
+                    "symbol": quote.symbol,
+                    "contract_id": contract_id,
+                    "bid": quote.bid,
+                    "ask": quote.ask,
+                    "last": quote.last,
+                    "volume": quote.volume,
+                    "bid_size": quote.bid_size,
+                    "ask_size": quote.ask_size,
+                    "last_size": quote.last_size,
+                    "volume_is_cumulative": quote.volume_is_cumulative,
+                    "quote_is_synthetic": quote.quote_is_synthetic,
+                    "trade_side": quote.trade_side,
+                    "latency_ms": quote.latency_ms,
+                    "source": "GatewayTrade",
+                    "timestamp": quote.timestamp,
+                }
+            )
 
             if not self._stream_ready.is_set():
                 self._stream_error = None

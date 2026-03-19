@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 import math
 import random
+import os
 import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -67,6 +68,10 @@ class Order:
     activation_time: Optional[datetime] = None
     is_protective: bool = False
     role: str = "entry"
+    decision_id: Optional[str] = None
+    attempt_id: Optional[str] = None
+    position_id: Optional[str] = None
+    trade_id: Optional[str] = None
 
     def __post_init__(self) -> None:
         if self.remaining_quantity == 0:
@@ -116,14 +121,24 @@ class OrderExecutor:
         action: Optional[str] = None,
         reason: Optional[str] = None,
         order_id: Optional[str] = None,
+        order: Optional[Order] = None,
     ) -> None:
         """Record execution event. Fail-open: never raise so trading is never blocked by observability."""
+        payload = payload or {}
+        resolved_order = order
+        if resolved_order is None and order_id is not None:
+            resolved_order = self._pending_orders.get(order_id)
+            if resolved_order is None:
+                for filled_order in self._filled_orders:
+                    if filled_order.order_id == order_id:
+                        resolved_order = filled_order
+                        break
         try:
             self.observability.record_event(
                 category="execution",
                 event_type=event_type,
                 source=__name__,
-                payload=payload or {},
+                payload=payload,
                 event_time=event_time,
                 symbol=symbol,
                 action=action,
@@ -131,6 +146,52 @@ class OrderExecutor:
                 order_id=order_id,
                 risk_state=None,
             )
+            lifecycle_events = {
+                "order_submission_requested",
+                "order_submitted",
+                "order_submission_failed",
+                "order_submission_fallback",
+                "order_fill",
+                "order_cancelled",
+                "order_cancel_failed",
+                "order_status_updated",
+                "protection_placed",
+                "protection_failed",
+                "protection_unchanged",
+                "sibling_protection_cancelled",
+                "stale_order_cancelled",
+            }
+            if event_type in lifecycle_events:
+                lifecycle_payload = {
+                    "observed_at": event_time or datetime.now(UTC),
+                    "run_id": self.observability.get_run_id(),
+                    "process_id": os.getpid(),
+                    "decision_id": (resolved_order.decision_id if resolved_order is not None else None) or payload.get("decision_id"),
+                    "attempt_id": (resolved_order.attempt_id if resolved_order is not None else None) or payload.get("attempt_id"),
+                    "order_id": order_id or (resolved_order.order_id if resolved_order is not None else None),
+                    "position_id": (resolved_order.position_id if resolved_order is not None else None) or payload.get("position_id"),
+                    "trade_id": (resolved_order.trade_id if resolved_order is not None else None) or payload.get("trade_id"),
+                    "symbol": symbol or (resolved_order.symbol if resolved_order is not None else None),
+                    "event_type": event_type,
+                    "status": payload.get("status") or (resolved_order.status.value if resolved_order is not None else None),
+                    "side": payload.get("side") or (resolved_order.side if resolved_order is not None else None),
+                    "role": payload.get("role") or (resolved_order.role if resolved_order is not None else None),
+                    "is_protective": payload.get("is_protective") if payload.get("is_protective") is not None else (resolved_order.is_protective if resolved_order is not None else None),
+                    "order_type": payload.get("order_type") or (resolved_order.order_type if resolved_order is not None else None),
+                    "quantity": payload.get("quantity") or (resolved_order.quantity if resolved_order is not None else None),
+                    "contracts": payload.get("contracts") or (resolved_order.quantity if resolved_order is not None else None),
+                    "limit_price": payload.get("limit_price") or (resolved_order.limit_price if resolved_order is not None else None),
+                    "stop_price": payload.get("stop_price") or (resolved_order.stop_price if resolved_order is not None else None),
+                    "expected_fill_price": payload.get("expected_fill_price"),
+                    "filled_price": payload.get("filled_price") or (resolved_order.filled_price if resolved_order is not None else None),
+                    "filled_quantity": payload.get("filled_quantity") or (resolved_order.filled_quantity if resolved_order is not None else None),
+                    "remaining_quantity": payload.get("remaining_quantity") or (resolved_order.remaining_quantity if resolved_order is not None else None),
+                    "zone": payload.get("zone"),
+                    "reason": reason or payload.get("reason"),
+                    "lifecycle_state": payload.get("lifecycle_state") or self._lifecycle_state.value,
+                    "payload": {**payload, "event_type": event_type, "order_id": order_id or (resolved_order.order_id if resolved_order is not None else None)},
+                }
+                self.observability.record_order_lifecycle(lifecycle_payload)
         except Exception:
             logger.exception("Observability record_event failed (fail-open); event_type=%s", event_type)
 
@@ -191,6 +252,10 @@ class OrderExecutor:
         use_limit_fallback: bool = True,
         is_protective: bool = False,
         role: str = "entry",
+        decision_id: Optional[str] = None,
+        attempt_id: Optional[str] = None,
+        position_id: Optional[str] = None,
+        trade_id: Optional[str] = None,
     ) -> Optional[Order]:
         """Place an order."""
         if quantity <= 0:
@@ -209,7 +274,7 @@ class OrderExecutor:
         )
 
         if self._mock_mode:
-            return self._place_mock_order(symbol, quantity, side, order_type, limit_price, stop_price, is_protective, role)
+            return self._place_mock_order(symbol, quantity, side, order_type, limit_price, stop_price, is_protective, role, decision_id, attempt_id, position_id, trade_id)
 
         self._lifecycle_state = ExecutionState.ACK_PENDING
         attempts = max(1, getattr(self.exec_config, "retry_attempts", 3))
@@ -248,6 +313,10 @@ class OrderExecutor:
                 activation_time=created_time,
                 is_protective=is_protective,
                 role=role,
+                decision_id=decision_id,
+                attempt_id=attempt_id,
+                position_id=position_id,
+                trade_id=trade_id,
             )
             self._pending_orders[order_id] = order
             self._last_ack_time = created_time
@@ -282,7 +351,21 @@ class OrderExecutor:
                 action="fallback_to_market",
                 reason="limit_order_failed",
             )
-            return self.place_order(symbol, quantity, side, "market", None, None, False, is_protective, role)
+            return self.place_order(
+                symbol,
+                quantity,
+                side,
+                "market",
+                None,
+                None,
+                False,
+                is_protective,
+                role,
+                decision_id=decision_id,
+                attempt_id=attempt_id,
+                position_id=position_id,
+                trade_id=trade_id,
+            )
         return None
 
     def _place_mock_order(
@@ -295,6 +378,10 @@ class OrderExecutor:
         stop_price: Optional[float],
         is_protective: bool,
         role: str,
+        decision_id: Optional[str] = None,
+        attempt_id: Optional[str] = None,
+        position_id: Optional[str] = None,
+        trade_id: Optional[str] = None,
     ) -> Order:
         """Place a mock order with simple replay-aware fills."""
         created_time = self._current_time(symbol)
@@ -312,6 +399,10 @@ class OrderExecutor:
             activation_time=None,
             is_protective=is_protective,
             role=role,
+            decision_id=decision_id,
+            attempt_id=attempt_id,
+            position_id=position_id,
+            trade_id=trade_id,
         )
         self._pending_orders[order.order_id] = order
         self._last_ack_time = created_time
@@ -519,6 +610,11 @@ class OrderExecutor:
             order.status = OrderStatus.CANCELLED
             order.updated_time = self._last_ack_time
             self._pending_orders.pop(order_id, None)
+            if order.is_protective:
+                remaining_protection = self._remove_protective_order_reference(order.symbol, order_id)
+                self._lifecycle_state = ExecutionState.PROTECTED if remaining_protection else ExecutionState.WORKING
+            elif not self.get_active_orders(symbol=order.symbol, is_protective=False):
+                self._lifecycle_state = ExecutionState.FLAT
             self._record_event(
                 event_type="order_cancelled",
                 payload={"mock_mode": False, "is_protective": order.is_protective, "role": order.role},
@@ -630,6 +726,10 @@ class OrderExecutor:
         direction: int,
         stop_price: Optional[float],
         take_profit: Optional[float],
+        decision_id: Optional[str] = None,
+        attempt_id: Optional[str] = None,
+        position_id: Optional[str] = None,
+        trade_id: Optional[str] = None,
     ) -> int:
         """Place or refresh local protective orders."""
         if quantity <= 0 or (stop_price is None and take_profit is None):
@@ -687,6 +787,10 @@ class OrderExecutor:
                 use_limit_fallback=False,
                 is_protective=True,
                 role="stop_loss",
+                decision_id=decision_id,
+                attempt_id=attempt_id,
+                position_id=position_id,
+                trade_id=trade_id,
             )
             if stop_order is not None:
                 orders.append(stop_order.order_id)
@@ -701,6 +805,10 @@ class OrderExecutor:
                 use_limit_fallback=False,
                 is_protective=True,
                 role="take_profit",
+                decision_id=decision_id,
+                attempt_id=attempt_id,
+                position_id=position_id,
+                trade_id=trade_id,
             )
             if target_order is not None:
                 orders.append(target_order.order_id)
@@ -777,6 +885,22 @@ class OrderExecutor:
         )
         return cancelled
 
+    def _remove_protective_order_reference(self, symbol: str, order_id: str) -> bool:
+        """Remove a tracked protective order reference.
+
+        Returns True when protection is still tracked for the symbol after removal.
+        """
+        record = self._protective_orders.get(symbol)
+        if not record:
+            return False
+        remaining = [tracked_id for tracked_id in record.get("orders", []) if tracked_id != order_id]
+        if remaining:
+            record["orders"] = remaining
+            self._protective_orders[symbol] = record
+            return True
+        self._protective_orders.pop(symbol, None)
+        return False
+
     def protection_pending_too_long(self, symbol: str, current_time: datetime, timeout_seconds: int) -> bool:
         """Return True when protection should exist but is still not active."""
         requested_at = self._protection_requested_at.get(symbol)
@@ -840,7 +964,10 @@ class OrderExecutor:
         elif status in {OrderStatus.CANCELLED, OrderStatus.REJECTED}:
             self._pending_orders.pop(order_id, None)
             self._last_ack_time = order.updated_time
-            if not self.get_active_orders(symbol=order.symbol, is_protective=False):
+            if order.is_protective:
+                remaining_protection = self._remove_protective_order_reference(order.symbol, order_id)
+                self._lifecycle_state = ExecutionState.PROTECTED if remaining_protection else ExecutionState.WORKING
+            elif not self.get_active_orders(symbol=order.symbol, is_protective=False):
                 self._lifecycle_state = ExecutionState.FLAT
         self._record_event(
             event_type="order_status_updated",

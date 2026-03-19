@@ -418,6 +418,9 @@ class ObservabilityConfig:
     capture_run_provenance: bool = True
     persist_completed_trades: bool = True
     backfill_missing_trade_records: bool = True
+    sync_account_trade_history_on_startup: bool = True
+    account_trade_history_lookback_hours: int = 168
+    internal_api_token: str = ""
     railway_ingest_url: str = ""
     railway_ingest_api_key: str = ""
     bridge_interval_seconds: float = 30.0
